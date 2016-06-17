@@ -40,7 +40,7 @@ class Notifications(object):
 
         self.dynamic_quota = dynamic_quota
 
-    def info(self, event_type, payload):
+    def info(self, ctxt, publisher_id, event_type, payload, metadata):
         LOG.debug("Notification INFO: event_type=%s payload=%s"
                   % (event_type, payload))
 
@@ -69,8 +69,6 @@ class Notifications(object):
             instance_id = instance_info["instance_id"]
             ram = instance_info["memory_mb"]
             cores = instance_info["vcpus"]
-            # disk = instance_info["root_gb"]
-            # node = instance_info["node"]
 
             LOG.debug("Notification INFO (type=%s state=%s): cores=%s ram=%s "
                       "prj_id=%s instance_id=%s"
@@ -81,15 +79,15 @@ class Notifications(object):
             except Exception as ex:
                 LOG.warn("Notification INFO: %s" % ex)
 
-    def warn(self, event_type, payload):
+    def warn(self, ctxt, publisher_id, event_type, payload, metadata):
         state = payload["state"]
         instance_id = payload["instance_id"]
-        LOG.info("Notification WARN: event_type=%s state=%s instance_id=%s"
-                 % (event_type, state, instance_id))
+        LOG.debug("Notification WARN: event_type=%s state=%s instance_id=%s"
+                  % (event_type, state, instance_id))
 
-    def error(self, event_type, payload, metadata):
-        LOG.info("Notification ERROR: event_type=%s payload=%s metadata=%s"
-                 % (event_type, payload, metadata))
+    def error(self, ctxt, publisher_id, event_type, payload, metadata):
+        LOG.debug("Notification ERROR: event_type=%s payload=%s metadata=%s"
+                  % (event_type, payload, metadata))
 
 
 class Worker(threading.Thread):
@@ -110,7 +108,6 @@ class Worker(threading.Thread):
 
     def destroy(self):
         try:
-            # if self.queue:
             self.queue.close()
 
             self.exit = True
@@ -126,8 +123,6 @@ class Worker(threading.Thread):
                 queue_item = self.queue.getItem()
             except Exception as ex:
                 LOG.error("Worker %r: %s" % (self.name, ex))
-                # self.exit = True
-                # break
                 continue
 
             if queue_item is None:
@@ -137,7 +132,6 @@ class Worker(threading.Thread):
                 request = queue_item.getData()
 
                 instance = request["instance"]
-                # user_id = instance["nova_object.data"]["user_id"]
                 prj_id = instance["nova_object.data"]["project_id"]
                 uuid = instance["nova_object.data"]["uuid"]
                 vcpus = instance["nova_object.data"]["vcpus"]
@@ -153,8 +147,6 @@ class Worker(threading.Thread):
                 image = request["image"]
 
                 try:
-                    # vm_instance = self.novaConductorAPI.instance_get_by_uuid
-                    # (context, instance_uuid=instance_uuid)
                     server = self.nova_manager.execute("GET_SERVER",
                                                        id=uuid)
                 except Exception as ex:
@@ -162,26 +154,13 @@ class Worker(threading.Thread):
                              % (self.name, uuid, ex))
                     self.queue.deleteItem(queue_item)
 
-                    self.quota.release(instance_id=uuid,
-                                       prj_id=prj_id,
-                                       cores=vcpus,
-                                       ram=memory_mb)
+                    self.nova_manager.execute("DELETE_SERVER", id=uuid)
                     continue
 
                 if server["OS-EXT-STS:vm_state"] != "building" or \
                    server["OS-EXT-STS:task_state"] != "scheduling":
                     self.queue.deleteItem(queue_item)
-
-                    self.quota.release(instance_id=uuid,
-                                       prj_id=prj_id,
-                                       cores=vcpus,
-                                       ram=memory_mb)
                     continue
-
-                # LOG.info(request_spec)
-
-                # if (self.quota.reserve(instance_uuid, vcpus, memory_mb)):
-                # done = False
 
                 if self.quota.allocate(instance_id=uuid,
                                        prj_id=prj_id,
@@ -217,14 +196,8 @@ class Worker(threading.Thread):
                 self.queue.deleteItem(queue_item)
             except Exception as ex:
                 LOG.error("Worker '%s': %s" % (self.name, ex))
-                # self.queue.reinsertItem(queue_item)
-
                 continue
 
-            # LOG.info("Worker done is %s" % done)
-
-        # LOG.info(">>>> Worker '%s' queue.isClosed %s exit=%s"
-        # % (self.name, self.queue.isClosed(), self.exit))
         LOG.info("Worker '%s' destroyed!" % self.name)
 
 
@@ -268,85 +241,6 @@ class SchedulerManager(Manager):
         self.listener = None
         self.exit = False
 
-        try:
-            self.dynamic_quota = self.quota_manager.execute(
-                "GET_DYNAMIC_QUOTA")
-
-            k_projects = self.keystone_manager.execute("GET_PROJECTS")
-
-            for k_project in k_projects:
-                prj_id = str(k_project["id"])
-                prj_name = str(k_project["name"])
-
-                if prj_name in CONF.SchedulerManager.projects:
-                    CONF.SchedulerManager.projects.remove(prj_name)
-
-                    self.projects[prj_name] = {"id": prj_id,
-                                               "name": prj_name,
-                                               "type": "dynamic",
-                                               "share": float(0),
-                                               "TTL": self.default_TTL}
-
-            if len(CONF.SchedulerManager.projects) > 0:
-                raise Exception("projects %s not found"
-                                % CONF.SchedulerManager.projects)
-
-            for prj_ttl in CONF.SchedulerManager.TTLs:
-                prj_name, TTL = self.parseAttribute(prj_ttl)
-                self.projects[prj_name]["TTL"] = TTL
-
-            for prj_share in CONF.SchedulerManager.shares:
-                prj_name, share = self.parseAttribute(prj_share)
-                self.projects[prj_name]["share"] = share
-
-            for project in self.projects.values():
-                prj_id = project["id"]
-                prj_name = project["name"]
-                prj_share = project["share"]
-
-                del self.projects[prj_name]
-                self.projects[prj_id] = project
-
-                quota = {"cores": -1, "ram": -1, "instances": -1}
-
-                self.nova_manager.execute("UPDATE_QUOTA",
-                                          id=prj_id,
-                                          data=quota)
-
-                self.quota_manager.execute("ADD_PROJECT",
-                                           prj_id=prj_id,
-                                           prj_name=prj_name)
-
-                self.fairshare_manager.execute("ADD_PROJECT",
-                                               prj_id=prj_id,
-                                               prj_name=prj_name,
-                                               share=prj_share)
-            try:
-                self.dynamic_queue = self.queue_manager.execute("CREATE_QUEUE",
-                                                                name="DYNAMIC")
-            except Exception as ex:
-                LOG.error("Exception has occured", exc_info=1)
-                LOG.error(ex)
-
-            self.dynamic_queue = self.queue_manager.execute("GET_QUEUE",
-                                                            name="DYNAMIC")
-
-            dynamic_worker = Worker(name="DYNAMIC",
-                                    queue=self.dynamic_queue,
-                                    quota=self.dynamic_quota,
-                                    nova_manager=self.nova_manager)
-            dynamic_worker.start()
-
-            self.workers.append(dynamic_worker)
-
-            print(self.projects)
-            print(self.dynamic_quota.toDict())
-
-        except Exception as ex:
-            LOG.error("Exception has occured", exc_info=1)
-            LOG.error(ex)
-            raise ex
-
     def parseAttribute(self, attribute):
         if attribute is None:
             return None
@@ -381,6 +275,92 @@ class SchedulerManager(Manager):
 
     def task(self):
         if self.listener is None:
+            self.dynamic_quota = self.quota_manager.execute(
+                "GET_DYNAMIC_QUOTA")
+
+            defaults = self.nova_manager.execute("GET_QUOTA", defaults=True)
+
+            k_projects = self.keystone_manager.execute("GET_PROJECTS")
+
+            for k_project in k_projects:
+                prj_id = str(k_project["id"])
+                prj_name = str(k_project["name"])
+
+                if prj_name in CONF.SchedulerManager.projects:
+                    CONF.SchedulerManager.projects.remove(prj_name)
+
+                    self.projects[prj_name] = {"id": prj_id,
+                                               "name": prj_name,
+                                               "type": "dynamic",
+                                               "share": float(0),
+                                               "TTL": self.default_TTL}
+
+                    self.nova_manager.execute("UPDATE_QUOTA",
+                                              id=prj_id,
+                                              cores=-1,
+                                              ram=-1,
+                                              instances=-1)
+                else:
+                    quota = self.nova_manager.execute("GET_QUOTA", id=prj_id)
+
+                    if quota["cores"] == -1 and quota["ram"] == -1 and \
+                            quota["instances"] == -1:
+                        self.nova_manager.execute(
+                            "UPDATE_QUOTA",
+                            id=prj_id,
+                            cores=defaults["cores"],
+                            ram=defaults["ram"],
+                            instances=defaults["instances"])
+
+            if len(CONF.SchedulerManager.projects) > 0:
+                raise Exception("projects %s not found"
+                                % CONF.SchedulerManager.projects)
+
+            for prj_ttl in CONF.SchedulerManager.TTLs:
+                prj_name, TTL = self.parseAttribute(prj_ttl)
+                self.projects[prj_name]["TTL"] = TTL
+
+            for prj_share in CONF.SchedulerManager.shares:
+                prj_name, share = self.parseAttribute(prj_share)
+                self.projects[prj_name]["share"] = share
+
+            for project in self.projects.values():
+                prj_id = project["id"]
+                prj_name = project["name"]
+                prj_share = project["share"]
+
+                del self.projects[prj_name]
+                self.projects[prj_id] = project
+
+                self.quota_manager.execute("ADD_PROJECT",
+                                           prj_id=prj_id,
+                                           prj_name=prj_name)
+
+                self.fairshare_manager.execute("ADD_PROJECT",
+                                               prj_id=prj_id,
+                                               prj_name=prj_name,
+                                               share=prj_share)
+
+            self.fairshare_manager.execute("CALCULATE_FAIRSHARE")
+
+            try:
+                self.dynamic_queue = self.queue_manager.execute("CREATE_QUEUE",
+                                                                name="DYNAMIC")
+            except Exception as ex:
+                LOG.error("Exception has occured", exc_info=1)
+                LOG.error(ex)
+
+            self.dynamic_queue = self.queue_manager.execute("GET_QUEUE",
+                                                            name="DYNAMIC")
+
+            dynamic_worker = Worker(name="DYNAMIC",
+                                    queue=self.dynamic_queue,
+                                    quota=self.dynamic_quota,
+                                    nova_manager=self.nova_manager)
+            dynamic_worker.start()
+
+            self.workers.append(dynamic_worker)
+
             self.notifications = Notifications(self.dynamic_quota)
 
             target = self.nova_manager.execute("GET_TARGET",
@@ -394,17 +374,26 @@ class SchedulerManager(Manager):
             LOG.info("listener created")
 
             self.listener.start()
+
         for prj_id, project in self.dynamic_quota.getProjects().items():
             instances = project["instances"]["active"]
             TTL = self.projects[prj_id]["TTL"]
-            uuids = self.nova_manager.execute("GET_EXPIRED_SERVERS",
-                                              prj_id=prj_id,
-                                              instances=instances,
-                                              TTL=TTL)
+            servers = self.nova_manager.execute("GET_EXPIRED_SERVERS",
+                                                prj_id=prj_id,
+                                                instances=instances,
+                                                TTL=TTL)
 
-            for uuid in uuids:
-                LOG.info("deleting the expired instance %r from project=%s"
-                         % (uuid, prj_id))
+            for uuid, state in servers.items():
+                if state == "error":
+                    LOG.info("the server instance %r will be destroyed because"
+                             " it is in %s state (TTL=%s, prj_id=%r)"
+                             % (uuid, state, TTL, prj_id))
+                else:
+                    LOG.info("the server instance %r will be destroyed because"
+                             " it exceeded its maximum time to live (TTL=%s, "
+                             "state=%s, prj_id=%r)"
+                             % (uuid, TTL, state, prj_id))
+
                 self.nova_manager.execute("DELETE_SERVER", id=uuid)
 
     def destroy(self):
@@ -423,8 +412,6 @@ class SchedulerManager(Manager):
             memory_mb = instance["nova_object.data"]["memory_mb"]
 
             if prj_id in self.projects:
-                # prj_name = self.projects[prj_id]["name"]
-                # metadata = instance["nova_object.data"]["metadata"]
                 timestamp = instance["nova_object.data"]["created_at"]
                 timestamp = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
                 priority = 0
@@ -439,7 +426,7 @@ class SchedulerManager(Manager):
                                                        prj_id=prj_id,
                                                        cores=vcpus,
                                                        ram=memory_mb)
-                            priority = 999999999999
+                            priority = 99999999
                             LOG.info("released resource uuid %s "
                                      "num_attempts %s" % (uuid, num_attempts))
                 except Exception as ex:

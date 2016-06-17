@@ -100,6 +100,8 @@ class FairShareManager(Manager):
             return result
         elif command == "CALCULATE_PRIORITY":
             return self.calculatePriority(*args, **kargs)
+        elif command == "CALCULATE_FAIRSHARE":
+            return self.calculateFairShare(*args, **kargs)
         else:
             raise Exception("command=%r not supported!" % command)
 
@@ -177,6 +179,9 @@ class FairShareManager(Manager):
                 self.condition.notifyAll()
 
     def calculateFairShare(self):
+        if not self.projects:
+            return
+
         total_prj_share = float(0)
         total_usage_ram = float(0)
         total_usage_cores = float(0)
@@ -249,7 +254,6 @@ class FairShareManager(Manager):
             # check the share for each user and update the usage_record
             users = project["users"]
             prj_id = project["id"]
-            # prj_name = project["name"]
             prj_share = project["share"]
             sibling_share = float(0)
 
@@ -285,8 +289,10 @@ class FairShareManager(Manager):
                 if prj_share > 0 and sibling_share > 0 and total_prj_share > 0:
                     user["norm_share"] = (user_share / sibling_share) * \
                                          (prj_share / total_prj_share)
+                    project["norm_share"] = prj_share / total_prj_share
                 else:
                     user["norm_share"] = user_share
+                    project["norm_share"] = prj_share
 
                 if total_usage_ram > 0:
                     user_usage["norm_ram"] /= total_usage_ram
@@ -309,14 +315,6 @@ class FairShareManager(Manager):
             prj_share = project["share"]
             sibling_share = project["sibling_share"]
             users = project["users"]
-
-            # effect_prj_cores_usage = actual_usage_cores +
-            # ((total_actual_usage_cores - actual_usage_cores) *
-            # prj_share / total_prj_share)
-
-            # effect_prj_cores_usage = actual_usage_ram +
-            # ((total_actual_usage_ram - actual_usage_ram) *
-            # prj_share / total_prj_share)
 
             effect_prj_ram_usage = actual_usage_ram
             effect_prj_cores_usage = actual_usage_cores
@@ -358,13 +356,8 @@ class FairShareManager(Manager):
                         user_usage["effective_rel_cores"] /= actual_usage_cores
 
                     if actual_usage_ram > 0:
-                        user_usage["effect_rel_ram"] = norm_usage_ram
-                        user_usage["effect_rel_ram"] /= actual_usage_ram
-
-                    # user["effect_usage_rel_cores"] = effect_usage_cores /
-                    # effect_prj_cores_usage
-                    # user["effect_usage_rel_ram"] = effect_usage_ram /
-                    # effect_prj_cores_usage
+                        user_usage["effective_rel_ram"] = norm_usage_ram
+                        user_usage["effective_rel_ram"] /= actual_usage_ram
 
                     if norm_share > 0:
                         f_ram = 2 ** (-effect_usage_ram / norm_share)
