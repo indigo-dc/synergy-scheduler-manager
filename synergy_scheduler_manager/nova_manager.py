@@ -853,9 +853,11 @@ class NovaManager(Manager):
 
         return response_data
 
-    def updateQuota(self, id, data):
+    def updateQuota(self, id, cores, ram, instances):
         url = "os-quota-sets/%s" % id
-        quota_set = {"quota_set": data}
+        quota_set = {"quota_set": {"cores": cores,
+                                   "ram": ram,
+                                   "instances": instances}}
 
         try:
             response_data = self.getResource(url, "PUT", quota_set)
@@ -936,20 +938,13 @@ class NovaManager(Manager):
         return self.messagingAPI.getNotificationListener(targets, endpoints)
 
     def getResourceUsage(self, prj_ids, from_date, to_date):
-        # LOG.info("getUsage: fromDate=%s period_length=%s days"
-        #          % (fromDate, period_length))
-        # print("getUsage: fromDate=%s period_length=%s days"
-        #       % (fromDate, period_length))
-
-        # period = str(period_length)
-
         resource_usage = {}
         connection = self.db_engine.connect()
 
         try:
             ids = ""
 
-            if prj_ids is not None:
+            if prj_ids is not None and prj_ids:
                 ids = " project_id IN ("
 
                 for prj_id in prj_ids:
@@ -972,11 +967,9 @@ launched_at<='%(to_date)s' and (terminated_at>='%(from_date)s' or \
 terminated_at is NULL) group by user_id, project_id\
 """ % {"prj_ids": ids, "from_date": from_date, "to_date": to_date}
 
-            result = connection.execute(QUERY)
+            LOG.debug("getResourceUsage query: %s" % QUERY)
 
-            # LOG.info("QUERY %s\n" % QUERY)
-            # print("from_date %s\n" % from_date)
-            # print("to_date %s\n" % to_date)
+            result = connection.execute(QUERY)
 
             prj_id = 0
             user_id = 0
@@ -984,7 +977,6 @@ terminated_at is NULL) group by user_id, project_id\
 
             # for row in result.fetchall():
             for row in result:
-                # LOG.info("row=%s" % row)
                 user_id = row[0]
                 prj_id = row[1]
 
@@ -1015,9 +1007,11 @@ terminated_at is NULL) group by user_id, project_id\
             # retrieve the amount of resources in terms of cores
             # and ram the specified project is consuming
             QUERY = """select uuid, vcpus, memory_mb from nova.instances \
-where project_id='%(project_id)s' and deleted_at is NULL and (vm_state in \
-('error') or (vm_state in ('active') and terminated_at is NULL))\
+where project_id='%(project_id)s' and deleted_at is NULL and (vm_state=\
+'error' or (vm_state='active' and terminated_at is NULL))\
 """ % {"project_id": prj_id}
+
+            LOG.debug("getProjectUsage query: %s" % QUERY)
 
             result = connection.execute(QUERY)
 
@@ -1033,7 +1027,7 @@ where project_id='%(project_id)s' and deleted_at is NULL and (vm_state in \
         return usage
 
     def getExpiredServers(self, prj_id, instances, TTL):
-        uuids = []
+        servers = {}
         connection = self.db_engine.connect()
 
         try:
@@ -1041,24 +1035,22 @@ where project_id='%(project_id)s' and deleted_at is NULL and (vm_state in \
             # project and expiration time
             ids = "'%s'" % "', '".join(instances)
 
-            QUERY = """select uuid from nova.instances where project_id = \
-'%(project_id)s' and deleted_at is NULL and (vm_state in ('error') or \
-(uuid in (%(instances)s) and ((vm_state in ('active') and terminated_at is \
-NULL and timestampdiff(minute, launched_at, utc_timestamp()) >= \
-%(expiration)s) or (vm_state in ('building') and task_state in ('scheduling') \
-and created_at != updated_at and timestampdiff(minute, updated_at, \
-utc_timestamp()) >= 20))))""" % {"project_id": prj_id,
-                                 "instances": ids,
-                                 "expiration": TTL}
+            QUERY = """select uuid, vm_state from nova.instances where project_id = \
+'%(project_id)s' and deleted_at is NULL and (vm_state='error' or \
+(uuid in (%(instances)s) and vm_state='active' and terminated_at is NULL \
+and timestampdiff(minute, launched_at, utc_timestamp()) >= %(expiration)s))\
+""" % {"project_id": prj_id, "instances": ids, "expiration": TTL}
 
-            # LOG.info(QUERY)
+            LOG.debug("getExpiredServers query: %s" % QUERY)
+
             result = connection.execute(QUERY)
 
             for row in result.fetchall():
-                uuids.append(row[0])
+                servers[row[0]] = row[1]
+
         except SQLAlchemyError as ex:
             raise Exception(ex.message)
         finally:
             connection.close()
 
-        return uuids
+        return servers
