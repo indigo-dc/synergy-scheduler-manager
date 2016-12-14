@@ -1,3 +1,71 @@
+python-synergy-scheduler-manager (2.2.2) unstable; urgency=low
+
+  * Make SchedulerManager handle ERROR notifications
+
+ -- Vincent Llorens <vincent.llorens@cc.in2p3.fr>  Wed, 14 Dec 2016 10:49:24 +0100
+
+python-synergy-scheduler-manager (2.2.1) unstable; urgency=low
+
+  * fix: update required version of synergy-service
+
+ -- Vincent Llorens <vincent.llorens@cc.in2p3.fr>  Mon, 12 Dec 2016 14:31:54 +0100
+
+python-synergy-scheduler-manager (2.2.0) unstable; urgency=low
+
+  * [packaging] make docker aware of PKG_VERSION
+  * Synergy releases in advance the VMs that are going to be destroyed
+  * Queue.updatePriority() takes much time if the queue is large
+  * Add the new clock_skew parameter for KeystoneManager
+  * Invalid input for field/attribute quota_class_set
+  * KeystoneManager.authenticate() uses a wrong domain attribute
+  * Add a backfill_depth parameter
+  * Item readjustment fixed in PriorityQueue
+  * The FairshareManager should not use the Manager.condition var
+  * Fix scheduling when shared quota is disabled
+  * Update changelogs and system package versions
+
+ -- Vincent Llorens <vincent.llorens@cc.in2p3.fr>  Mon, 12 Dec 2016 13:31:29 +0100
+
+python-synergy-scheduler-manager (2.1.0) unstable; urgency=low
+
+  * CLI command "synergy usage show" enhanced
+  * Clean up oslo imports
+
+ -- Vincent Llorens <vincent.llorens@cc.in2p3.fr>  Fri, 09 Dec 2016 10:04:19 +0100
+
+python-synergy-scheduler-manager (2.0.0ubuntu1) unstable; urgency=low
+
+  * Synergy doesn't rely anymore on nova.conf
+  * Method deserialize() fixed
+  * The QuotaCommand shows a wrong value (%) for the field 'share'
+
+ -- Vincent Llorens <vincent.llorens@cc.in2p3.fr>  Wed, 09 Nov 2016 15:46:25 +0100
+
+python-synergy-scheduler-manager (1.2.0ubuntu1) unstable; urgency=low
+
+  * Scheduler managers enhanced
+  * Remove versions for required packages
+  * fix git and pbr when packaging with docker
+  * fix synergy-service version in spec file (rpm)
+  * fix required packages when packaging
+  * fix to get the synergy version when packaging
+
+ -- Vincent Llorens <vincent.llorens@cc.in2p3.fr>  Wed, 09 Nov 2016 15:46:25 +0100
+
+python-synergy-scheduler-manager (1.1.0ubuntu1) unstable; urgency=low
+
+  * use pbr fully for easier package building
+  * fix connection URL to RabbitMQ
+  * Added Queue class to synergy_scheduler_manager/common/queue.py
+  * Common objects and relative test units added
+  * Destroy() method fixed
+  * Fix requirement version pinning
+  * Use dependency pinning
+  * fix OpenStack CentOS repo for docker packaging
+  * Cleanup tox.ini: Remove obsolete constraints
+
+ -- Vincent Llorens <vincent.llorens@cc.in2p3.fr>  Wed, 09 Nov 2016 15:46:25 +0100
+
 python-synergy-scheduler-manager (1.0.2ubuntu1) unstable; urgency=medium
 
   * Add "python-nova" as a dependency

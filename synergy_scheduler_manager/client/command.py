@@ -1,4 +1,9 @@
-from synergy.client.command import Execute
+from synergy.client.command import ExecuteCommand
+from synergy.client.tabulate import tabulate
+from synergy_scheduler_manager.common.project import Project
+from synergy_scheduler_manager.common.quota import SharedQuota
+from synergy_scheduler_manager.common.user import User
+
 
 __author__ = "Lisa Zangrando"
 __email__ = "lisa.zangrando[AT]pd.infn.it"
@@ -19,373 +24,268 @@ See the License for the specific language governing
 permissions and limitations under the License."""
 
 
-class GetQuota(Execute):
+class QueueCommand(ExecuteCommand):
 
     def __init__(self):
-        super(GetQuota, self).__init__("GET_DYNAMIC_QUOTA")
+        super(QueueCommand, self).__init__("QueueCommand")
 
     def configureParser(self, subparser):
-        parser = subparser.add_parser("get_quota",
-                                      add_help=True,
-                                      help="shows the dynamic quota info")
-        parser.add_argument("--long",
-                            action='store_true',
-                            help="shows more details")
+        queue_parser = subparser.add_parser('queue')
+        queue_subparsers = queue_parser.add_subparsers(dest="command")
+        queue_subparsers.add_parser("show", add_help=True,
+                                    help="shows the queue info")
 
-    def sendRequest(self, synergy_url, args):
-        self.long = args.long
+    def execute(self, synergy_url, args):
+        if args.command == "show":
+            command = "GET_QUEUE"
+            cmd_args = {"name": "DYNAMIC"}
 
-        super(GetQuota, self).sendRequest(
-            synergy_url + "/synergy/execute", "QuotaManager", self.getName())
+            queue = super(QueueCommand, self).execute(synergy_url,
+                                                      "QueueManager",
+                                                      command,
+                                                      args=cmd_args)
+            table = []
+            headers = ["name", "size", "is open"]
 
-    def log(self):
-        quota = self.getResults()
+            row = []
+            row.append(queue.getName())
+            row.append(queue.getSize())
+            row.append(str(queue.isOpen()).lower())
 
-        if not self.long:
-            cores_in_use = "{:d}".format(quota["cores"]["in_use"])
-            max_cores_in_use = max(len(cores_in_use), len("in use"))
+            table.append(row)
 
-            cores_limit = "{:.2f}".format(quota["cores"]["limit"])
-            max_cores_limit = max(len(cores_limit), len("limit"))
-
-            ram_in_use = "{:d}".format(quota["ram"]["in_use"])
-            max_ram_in_use = max(len(ram_in_use), len("in use"))
-
-            ram_limit = "{:.2f}".format(quota["ram"]["limit"])
-            max_ram_limit = max(len(ram_limit), len("limit"))
-
-            separator = "-" * (max_cores_in_use + max_cores_limit +
-                               max_ram_in_use + max_ram_limit + 7) + "\n"
-
-            raw = "| {0:%ss} | {1:%ss} | {2:%ss} |\n" % (
-                len("ram (MB)"),
-                max(max_cores_in_use, max_ram_in_use),
-                max(max_cores_limit, max_ram_limit))
-
-            msg = separator
-            msg += raw.format("type", "in use", "limit")
-            msg += separator
-            msg += raw.format("ram (MB)", ram_in_use, ram_limit)
-            msg += raw.format("cores", cores_in_use, cores_limit)
-            msg += separator
-
-            print(msg)
-        else:
-            max_ram = 0
-            max_ram_in_use = len("{:d}".format(quota["ram"]["in_use"]))
-            max_ram_limit = len("{:.2f}".format(quota["ram"]["limit"]))
-            max_cores = 0
-            max_cores_in_use = len("{:d}".format(quota["cores"]["in_use"]))
-            max_cores_limit = len("{:.2f}".format(quota["cores"]["limit"]))
-            max_prj_name = len("project")
-
-            for project in quota["projects"].values():
-                max_prj_name = max(len(project["name"]), max_prj_name)
-                max_ram = max(len("{:d}".format(project["ram"])), max_ram)
-                max_cores = max(len("{:d}".format(project["cores"])),
-                                max_cores)
-
-            separator = "-" * (max_prj_name + max_cores + max_cores_in_use +
-                               max_cores_limit + max_ram + max_ram_in_use +
-                               max_ram_limit + 48)
-
-            title = "| {0:%ss} | {1:%ss} | {2:%ss} |\n" % (
-                max_prj_name,
-                max_cores + max_cores_in_use + max_cores_limit + 19,
-                max_ram + max_ram_in_use + max_ram_limit + 19)
-
-            raw = "| {0:%ss} | in use={1:%d} ({2:%d}) | limit={3:%ss} |" \
-                  " in use={4:%d} ({5:%d}) | limit={6:%ss} |\n"
-            raw = raw % (max_prj_name, max_cores, max_cores_in_use,
-                         max_cores_limit, max_ram, max_ram_in_use,
-                         max_ram_limit)
-
-            msg = separator + "\n"
-            msg += title.format("project", "cores", "ram (MB)")
-            msg += separator + "\n"
-
-            for project in quota["projects"].values():
-                msg += raw.format(
-                    project["name"], project["cores"],
-                    quota["cores"]["in_use"],
-                    "{:.2f}".format(quota["cores"]["limit"]),
-                    project["ram"],
-                    quota["ram"]["in_use"],
-                    "{:.2f}".format(quota["ram"]["limit"]))
-            msg += separator + "\n"
-
-            print(msg)
+            print(tabulate(table, headers, tablefmt="fancy_grid"))
 
 
-class GetPriority(Execute):
+class QuotaCommand(ExecuteCommand):
 
     def __init__(self):
-        super(GetPriority, self).__init__("GET_PRIORITY")
+        super(QuotaCommand, self).__init__("QuotaCommand")
 
     def configureParser(self, subparser):
-        subparser.add_parser("get_priority",
-                             add_help=True,
-                             help="shows the users priority")
+        quota_parser = subparser.add_parser('quota')
+        quota_subparsers = quota_parser.add_subparsers(dest="command")
+        show_parser = quota_subparsers.add_parser("show", add_help=True,
+                                                  help="shows the quota info")
+        group = show_parser.add_mutually_exclusive_group()
+        group.add_argument("-i", "--project_id", metavar="<id>")
+        group.add_argument("-n", "--project_name", metavar="<name>")
+        group.add_argument("-a", "--all_projects", action="store_true")
+        group.add_argument("-s", "--shared", action="store_true")
 
-    def sendRequest(self, synergy_url, args):
-        super(GetPriority, self).sendRequest(
-            synergy_url + "/synergy/execute",
-            "FairShareManager",
-            self.getName())
+    def execute(self, synergy_url, args):
+        if args.command == "show":
+            command = "show"
+            cmd_args = {"shared": args.shared,
+                        "project_id": args.project_id,
+                        "project_name": args.project_name,
+                        "all_projects": args.all_projects}
 
-    def log(self):
-        projects = self.getResults()
+            result = super(QuotaCommand, self).execute(synergy_url,
+                                                       "QuotaManager",
+                                                       command,
+                                                       args=cmd_args)
 
-        max_prj = len("project")
-        max_user = len("user")
-        max_priority = len("priority")
+            if isinstance(result, SharedQuota):
+                self.printSharedQuota(result)
+            elif isinstance(result, Project):
+                self.printProjects([result])
+            else:
+                self.printProjects(result)
 
-        for prj_name, users in projects.items():
-            max_prj = max(len(prj_name), max_prj)
+    def printProjects(self, projects):
+        table = []
+        headers = ["project", "private quota", "shared quota", "share", "TTL"]
 
-            for user_name, priority in users.items():
-                max_user = max(len(user_name), max_user)
-                max_priority = max(len("{:.2f}".format(priority)),
-                                   max_priority)
+        for project in projects:
+            share = project.getShare()
+            norm_share = share.getNormalizedValue()
+            quota = project.getQuota()
+            vcpus_size = quota.getSize("vcpus", private=False)
+            vcpus_usage = quota.getUsage("vcpus", private=False)
+            memory_size = quota.getSize("memory", private=False)
+            memory_usage = quota.getUsage("memory", private=False)
 
-        separator = "-" * (max_prj + max_user + max_priority + 10) + "\n"
+            row = []
+            row.append(project.getName())
 
-        raw = "| {0:%ss} | {1:%ss} | {2:%ss} |\n" % (
-            max_prj, max_user, max_priority)
+            private = "vcpus: {:.2f} of {:.2f} | memory: {:.2f} of "\
+                      "{:.2f}".format(quota.getUsage("vcpus"),
+                                      quota.getSize("vcpus"),
+                                      quota.getUsage("memory"),
+                                      quota.getSize("memory"))
 
-        msg = separator
-        msg += raw.format("project", "user", "priority")
-        msg += separator
+            shared = "vcpus: {:.2f} of {:.2f} | memory: {:.2f} of {:.2f} | "\
+                     "share: {:.2f}% | TTL: {:.2f}".format(vcpus_usage,
+                                                           vcpus_size,
+                                                           memory_usage,
+                                                           memory_size,
+                                                           norm_share * 100,
+                                                           project.getTTL())
 
-        for prj_name in sorted(projects.keys()):
-            for user_name in sorted(projects[prj_name].keys()):
-                msg += raw.format(
-                    prj_name,
-                    user_name,
-                    "{:.2f}".format(projects[prj_name][user_name]))
+            row.append(private)
+            row.append(shared)
 
-        msg += separator
+            table.append(row)
 
-        print(msg)
+        print(tabulate(table, headers, tablefmt="fancy_grid"))
+
+    def printSharedQuota(self, quota):
+        table = []
+        headers = ["resource", "used", "size"]
+        resources = ["vcpus", "memory", "instances"]
+
+        for resource in resources:
+            row = [resource, quota.getUsage(resource), quota.getSize(resource)]
+            table.append(row)
+
+        print(tabulate(table, headers, tablefmt="fancy_grid"))
 
 
-class GetQueue(Execute):
+class UsageCommand(ExecuteCommand):
 
     def __init__(self):
-        super(GetQueue, self).__init__("GET_QUEUE")
+        super(UsageCommand, self).__init__("UsageCommand")
 
     def configureParser(self, subparser):
-        subparser.add_parser("get_queue",
-                             add_help=True,
-                             help="shows the queue info")
+        usage_parser = subparser.add_parser('usage')
+        usage_subparsers = usage_parser.add_subparsers(dest="command")
+        show_parser = usage_subparsers.add_parser("show", add_help=True,
+                                                  help="shows the usage info")
 
-    def sendRequest(self, synergy_url, args):
-        super(GetQueue, self).sendRequest(
-            synergy_url + "/synergy/execute",
-            "QueueManager",
-            self.getName(),
-            {"name": "DYNAMIC"})
+        subparsers = show_parser.add_subparsers()
+        parser_a = subparsers.add_parser('project', help='project help')
 
-    def log(self):
-        queue = self.getResults()
+        group = parser_a.add_mutually_exclusive_group()
+        group.add_argument("-d", "--project_id", metavar="<id>")
+        group.add_argument("-m", "--project_name", metavar="<name>")
+        group.add_argument("-a", "--all_projects", action="store_true")
 
-        max_status = len("status")
-        max_queue = max(len(queue["name"]), len("queue"))
-        max_size = max(len("{:d}".format(queue["size"])), len("size"))
+        parser_b = subparsers.add_parser('user', help='user help')
 
-        separator = "-" * (max_queue + max_status + max_size + 10) + "\n"
+        group = parser_b.add_mutually_exclusive_group(required=True)
+        group.add_argument("-d", "--project_id", metavar="<id>")
+        group.add_argument("-m", "--project_name", metavar="<name>")
 
-        raw = "| {0:%ss} | {1:%ss} | {2:%ss} |\n" % (
-            max_queue, max_status, max_size)
+        group = parser_b.add_mutually_exclusive_group(required=True)
+        group.add_argument("-i", "--user_id", metavar="<id>")
+        group.add_argument("-n", "--user_name", metavar="<name>")
+        group.add_argument("-a", "--all_users", action="store_true")
 
-        msg = separator
-        msg += raw.format("queue", "status", "size")
-        msg += separator
+    def execute(self, synergy_url, args):
+        if args.command == "show":
+            command = "show"
+            user_id = None
+            if hasattr(args, "user_id"):
+                user_id = args.user_id
 
-        msg += raw.format(queue["name"],
-                          queue["status"],
-                          "{:d}".format(queue["size"]))
+            user_name = None
+            if hasattr(args, "user_name"):
+                user_name = args.user_name
 
-        msg += separator
+            all_users = False
+            if hasattr(args, "all_users"):
+                all_users = args.all_users
 
-        print(msg)
+            project_id = None
+            if hasattr(args, "project_id"):
+                project_id = args.project_id
 
+            project_name = None
+            if hasattr(args, "project_name"):
+                project_name = args.project_name
 
-class GetShare(Execute):
+            all_projects = False
+            if hasattr(args, "all_projects"):
+                all_projects = args.all_projects
 
-    def __init__(self):
-        super(GetShare, self).__init__("GET_SHARE")
+            cmd_args = {"user_id": user_id,
+                        "user_name": user_name,
+                        "all_users": all_users,
+                        "project_id": project_id,
+                        "project_name": project_name,
+                        "all_projects": all_projects}
 
-    def configureParser(self, subparser):
-        parser = subparser.add_parser("get_share",
-                                      add_help=True,
-                                      help="shows the users share")
+            result = super(UsageCommand, self).execute(synergy_url,
+                                                       "SchedulerManager",
+                                                       command,
+                                                       args=cmd_args)
 
-        parser.add_argument("--long",
-                            action='store_true',
-                            help="shows more details")
+            if isinstance(result, Project):
+                self.printProjects([result])
+            elif isinstance(result, User):
+                self.printUsers([result])
+            elif isinstance(result, list):
+                if all(isinstance(n, Project) for n in result):
+                    self.printProjects(result)
+                else:
+                    self.printUsers(result)
 
-    def sendRequest(self, synergy_url, args):
-        self.long = args.long
+    def printProjects(self, projects):
+        if not projects:
+            return
 
-        super(GetShare, self).sendRequest(
-            synergy_url + "/synergy/execute",
-            "FairShareManager",
-            "GET_PROJECTS")
+        data = projects[0].getData()
+        date_format = "{:%d %b %Y %H:%M:%S}"
+        from_date = date_format.format(data["time_window_from_date"])
+        to_date = date_format.format(data["time_window_to_date"])
 
-    def log(self):
-        projects = self.getResults()
+        headers = ["project",
+                   "shared quota (%s - %s)" % (from_date, to_date),
+                   "share"]
 
-        max_prj = len("project")
-        max_usr = len("user")
-        max_prj_share = len("share")
-        max_usr_share = len("share")
+        table = []
 
-        if self.long:
-            for project in projects.values():
-                max_prj = max(len(project["name"]), max_prj)
-                max_prj_share = max(len("{:.2f}% ({:.2f})".format(
-                    project["norm_share"] * 100, project["share"])),
-                    max_prj_share)
+        for project in projects:
+            data = project.getData()
+            share = project.getShare()
+            row = []
+            row.append(project.getName())
 
-                for user in project["users"].values():
-                    max_usr = max(len(user["name"]), max_usr)
-                    max_usr_share = max(
-                        len("{:.2f}%".format(user["norm_share"] * 100)),
-                        max_usr_share)
+            shared = "vcpus: {:.2f}% | memory: {:.2f}%".format(
+                data["effective_vcpus"] * 100, data["effective_memory"] * 100)
 
-            separator = "-" * (max_prj + max_usr + max_prj_share +
-                               max_usr_share + 13) + "\n"
+            row.append(shared)
+            row.append("{:.2f}%".format(share.getNormalizedValue() * 100))
 
-            raw = "| {0:%ss} | {1:%ss} | {2:%ss} | {3:%ss} |\n" % (
-                  max_prj, max_prj_share, max_usr, max_usr_share)
+            table.append(row)
 
-            msg = separator
-            msg += raw.format("project", "share", "user", "share")
-            msg += separator
+        print(tabulate(table, headers, tablefmt="fancy_grid"))
 
-            for project in projects.values():
-                for user in project["users"].values():
-                    msg += raw.format(
-                        project["name"],
-                        "{:.2f}% ({:.2f})".format(project["norm_share"] * 100,
-                                                  project["share"]),
-                        user["name"],
-                        "{:.2f}%".format(user["norm_share"] * 100))
+    def printUsers(self, users):
+        if not users:
+            return
 
-            msg += separator
-            print(msg)
-        else:
-            for project in projects.values():
-                max_prj = max(len(project["name"]), max_prj)
-                max_prj_share = max(len("{:.2f}% ({:.2f})".format(
-                    project["norm_share"] * 100, project["share"])),
-                    max_prj_share)
+        table = []
 
-            separator = "-" * (max_prj + max_prj_share + 7) + "\n"
+        date_format = "{:%d %b %Y %H:%M:%S}"
+        data = users[0].getData()
 
-            raw = "| {0:%ss} | {1:%ss} |\n" % (max_prj, max_prj_share)
+        from_date = date_format.format(data["time_window_from_date"])
+        to_date = date_format.format(data["time_window_to_date"])
 
-            msg = separator
-            msg += raw.format("project", "share")
-            msg += separator
+        headers = ["user",
+                   "shared quota (%s - %s)" % (from_date, to_date),
+                   "share",
+                   "priority"]
 
-            for project in projects.values():
-                msg += raw.format(
-                    project["name"],
-                    "{:.2f}% ({:.2f})".format(project["norm_share"] * 100,
-                                              project["share"]))
+        for user in users:
+            share = user.getShare()
 
-            msg += separator
-            print(msg)
+            data = user.getData()
 
+            priority = user.getPriority()
 
-class GetUsage(Execute):
+            row = []
+            row.append(user.getName())
 
-    def __init__(self):
-        super(GetUsage, self).__init__("GET_USAGE")
+            row.append("vcpus: {:.2f}% | memory: {:.2f}%".format(
+                data["actual_rel_vcpus"] * 100,
+                data["actual_rel_memory"] * 100))
 
-    def configureParser(self, subparser):
-        subparser.add_parser("get_usage",
-                             add_help=True,
-                             help="retrieve the resource usages")
+            row.append("{:.2f}%".format(share.getNormalizedValue() * 100))
+            row.append("{:.2f}".format(priority.getValue()))
 
-    def sendRequest(self, synergy_url, args):
-        super(GetUsage, self).sendRequest(
-            synergy_url + "/synergy/execute",
-            "FairShareManager",
-            "GET_PROJECTS")
+            table.append(row)
 
-    def log(self):
-        projects = self.getResults()
-
-        max_prj = len("project")
-        max_usr = len("user")
-        max_prj_cores = len("cores")
-        max_usr_cores = len("cores")
-        max_prj_ram = len("ram")
-        max_usr_ram = len("ram (abs)")
-
-        for project in projects.values():
-            usage = project["usage"]
-
-            max_prj = max(len(project["name"]), max_prj)
-            max_prj_cores = max(len(
-                "{:.2f}%".format(usage["effective_cores"] * 100)),
-                max_prj_cores)
-
-            max_prj_ram = max(len(
-                "{:.2f}%".format(usage["effective_ram"] * 100)),
-                max_prj_ram)
-
-            for user in project["users"].values():
-                usage = user["usage"]
-
-                max_usr = max(len(user["name"]), max_usr)
-                max_usr_cores = max(len("{:.2f}% ({:.2f})%".format(
-                                    usage["effective_rel_cores"] * 100,
-                                    usage["norm_cores"] * 100)),
-                                    max_usr_cores)
-
-                max_usr_ram = max(len("{:.2f}% ({:.2f})%".format(
-                                  usage["effective_rel_ram"] * 100,
-                                  usage["norm_ram"] * 100)),
-                                  max_usr_ram)
-
-        separator = "-" * (max_prj + max_usr + max_prj_cores +
-                           max_usr_cores + max_prj_ram +
-                           max_usr_ram + 19) + "\n"
-
-        raw = "| {0:%ss} | {1:%ss} | {2:%ss} | {3:%ss} | {4:%ss} | " \
-              "{5:%ss} | \n" % (max_prj, max_prj_cores, max_prj_ram,
-                                max_usr, max_usr_cores, max_usr_ram)
-
-        msg = separator
-        msg += raw.format("project", "cores", "ram",
-                          "user", "cores (abs)", "ram (abs)")
-        msg += separator
-
-        for project in projects.values():
-            prj_usage = project["usage"]
-
-            for user in project["users"].values():
-                usr_usage = user["usage"]
-
-                prj_cores = "{:.2f}%".format(
-                    prj_usage["effective_cores"] * 100)
-
-                prj_ram = "{:.2f}%".format(prj_usage["effective_ram"] * 100)
-
-                usr_cores = "{:.2f}% ({:.2f}%)".format(
-                    usr_usage["effective_rel_cores"] * 100,
-                    usr_usage["norm_cores"] * 100)
-
-                usr_ram = "{:.2f}% ({:.2f}%)".format(
-                    usr_usage["effective_rel_ram"] * 100,
-                    usr_usage["norm_ram"] * 100)
-
-                msg += raw.format(
-                    project["name"], prj_cores, prj_ram,
-                    user["name"], usr_cores, usr_ram)
-        msg += separator
-        print(msg)
+        print(tabulate(table, headers, tablefmt="fancy_grid"))
