@@ -2,9 +2,12 @@
 # of appearance. Changing the order has an impact on the overall integration
 # process, which may cause wedges in the gate later.
 
-pbr>=1.6
-synergy-service>=1.0.0,<1.1.0
-oslo.config>=2.4.0,<3.0.0
-oslo.messaging>=2.5.0,<3.0.0
-requests>=2.7.0,<3.0.0
-sqlalchemy>=1.0.0,<1.1.0
+pbr
+
+oslo.config
+oslo.messaging
+oslo.serialization
+oslo.versionedobjects
+requests
+sqlalchemy
+synergy-service>=1.3,<1.4

@@ -7,12 +7,14 @@ PKG_DIR=/tmp/python-synergy-scheduler-manager
 function copy_source() {
     cd /home/pkger
     cp -r $PKG_DIR python-synergy-scheduler-manager
-    rm -r python-synergy-scheduler-manager/{.tox,.testrepository,build,dist} || true
+    rm -r python-synergy-scheduler-manager/{.eggs,.tox,.testrepository,build,dist} || true
 }
 
 function get_version() {
-    local file=/home/pkger/python-synergy-scheduler-manager/setup.cfg
-    export PKG_VERSION=$(grep -e "version = " $file | sed -r "s/version = ()/\1/")
+    if [[ -z $PKG_VERSION ]]; then
+        cd $PKG_DIR
+        export PKG_VERSION=$(git tag -l "*.*.*" | sort -V | tail -1)
+    fi
 }
 
 function setup() {
