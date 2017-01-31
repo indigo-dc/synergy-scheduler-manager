@@ -21,8 +21,8 @@ from nova.conductor.rpcapi import ComputeTaskAPI
 from nova.conductor.rpcapi import ConductorAPI
 from nova.objects import base as objects_base
 from oslo_config import cfg
+from oslo_messaging import exceptions as oslo_exceptions
 from oslo_serialization import jsonutils
-from oslo_versionedobjects import base as ovo_base
 from sqlalchemy import create_engine
 from sqlalchemy.exc import SQLAlchemyError
 from synergy.common.manager import Manager
@@ -53,10 +53,47 @@ CONFIG = ConfigParser.SafeConfigParser()
 
 class MessagingAPI(object):
 
-    def __init__(self, transport_url):
-        LOG.debug("setting up the AMQP transport url: %s" % transport_url)
+    def __init__(self, amqp_backend, amqp_user,
+                 amqp_password, amqp_hosts, amqp_virt_host):
         oslo_msg.set_transport_defaults(control_exchange="nova")
+
+        transport_hosts = self._createTransportHosts(amqp_user,
+                                                     amqp_password,
+                                                     amqp_hosts)
+
+        transport_url = oslo_msg.TransportURL(CONF,
+                                              transport=amqp_backend,
+                                              virtual_host=amqp_virt_host,
+                                              hosts=transport_hosts,
+                                              aliases=None)
+
         self.TRANSPORT = oslo_msg.get_transport(CONF, url=transport_url)
+
+    def _createTransportHosts(self, username, password, hosts):
+        """Returns a list of oslo.messaging.TransportHost objects."""
+        transport_hosts = []
+
+        for host in hosts:
+            host = host.strip()
+            host_name, host_port = host.split(":")
+
+            if not host_port:
+                msg = "Invalid hosts value: %s. It should be"\
+                      " in hostname:port format" % host
+                raise ValueError(msg)
+
+            try:
+                host_port = int(host_port)
+            except ValueError:
+                msg = "Invalid port value: %s. It should be an integer"
+                raise ValueError(msg % host_port)
+
+            transport_hosts.append(oslo_msg.TransportHost(
+                hostname=host_name,
+                port=host_port,
+                username=username,
+                password=password))
+        return transport_hosts
 
     def getTarget(self, topic, exchange=None, namespace=None,
                   version=None, server=None):
@@ -181,25 +218,38 @@ class NovaConductorAPI(ConductorAPI):
 
     def object_class_action(self, context, objname, objmethod, objver,
                             args, kwargs):
-        versions = ovo_base.obj_tree_get_versions(objname)
-        return self.object_class_action_versions(context,
-                                                 objname,
-                                                 objmethod,
-                                                 versions,
-                                                 args, kwargs)
+        try:
+            cctxt = self.client.prepare()
+            return cctxt.call(context, 'object_class_action',
+                              objname=objname, objmethod=objmethod,
+                              objver=objver, args=args, kwargs=kwargs)
+        except (oslo_msg.RemoteError,
+                oslo_exceptions.MessagingTimeout,
+                oslo_exceptions.MessageDeliveryFailure):
+            return None
 
     def object_class_action_versions(self, context, objname, objmethod,
                                      object_versions, args, kwargs):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'object_class_action_versions',
-                          objname=objname, objmethod=objmethod,
-                          object_versions=object_versions,
-                          args=args, kwargs=kwargs)
+        try:
+            cctxt = self.client.prepare()
+            return cctxt.call(context, 'object_class_action_versions',
+                              objname=objname, objmethod=objmethod,
+                              object_versions=object_versions,
+                              args=args, kwargs=kwargs)
+        except (oslo_msg.RemoteError,
+                oslo_exceptions.MessagingTimeout,
+                oslo_exceptions.MessageDeliveryFailure):
+            return None
 
     def object_action(self, context, objinst, objmethod, args, kwargs):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'object_action', objinst=objinst,
-                          objmethod=objmethod, args=args, kwargs=kwargs)
+        try:
+            cctxt = self.client.prepare()
+            return cctxt.call(context, 'object_action', objinst=objinst,
+                              objmethod=objmethod, args=args, kwargs=kwargs)
+        except (oslo_msg.RemoteError,
+                oslo_exceptions.MessagingTimeout,
+                oslo_exceptions.MessageDeliveryFailure):
+            return None
 
     def object_backport_versions(self, context, objinst, object_versions):
         cctxt = self.client.prepare()
@@ -230,11 +280,8 @@ class NovaConductorComputeAPI(ComputeTaskAPI):
                         admin_password, injected_files, requested_networks,
                         security_groups, block_device_mapping=None,
                         legacy_bdm=True):
-        # token = self.keystone_manager.validateToken(context["auth_token"])
-
         for instance in instances:
             try:
-
                 request = Request.build(context, instance, image,
                                         filter_properties, admin_password,
                                         injected_files, requested_networks,
@@ -343,6 +390,10 @@ class NovaManager(Manager):
                        help="the amqp backend tpye (e.g. rabbit, qpid)",
                        default=None,
                        required=True),
+            cfg.ListOpt("amqp_hosts",
+                        help="AMQP HA cluster host:port pairs",
+                        default=None,
+                        required=False),
             cfg.StrOpt("amqp_host",
                        help="the amqp host name",
                        default="localhost",
@@ -398,12 +449,23 @@ class NovaManager(Manager):
             cfg.IntOpt("timeout",
                        help="set the http connection timeout",
                        default=60,
+                       required=False),
+            cfg.StrOpt("ssl_ca_file",
+                       help="set the PEM encoded Certificate Authority to "
+                            "use when verifying HTTPs connections",
+                       default=None,
+                       required=False),
+            cfg.StrOpt("ssl_cert_file",
+                       help="set the SSL client certificate (PEM encoded)",
+                       default=None,
                        required=False)
         ]
 
     def setup(self):
         eventlet.monkey_patch(os=False)
 
+        self.ssl_ca_file = CONF.NovaManager.ssl_ca_file
+        self.ssl_cert_file = CONF.NovaManager.ssl_cert_file
         self.timeout = CONF.NovaManager.timeout
 
         if self.getManager("KeystoneManager") is None:
@@ -416,6 +478,8 @@ class NovaManager(Manager):
         self.scheduler_manager = self.getManager("SchedulerManager")
 
         amqp_backend = self.getParameter("amqp_backend", fallback=True)
+
+        amqp_hosts = self.getParameter("amqp_hosts")
 
         amqp_host = self.getParameter("amqp_host")
 
@@ -437,22 +501,17 @@ class NovaManager(Manager):
 
         self.getParameter("metadata_proxy_shared_secret", fallback=True)
 
+        if not amqp_hosts:
+            amqp_hosts = ["%s:%s" % (amqp_host, amqp_port)]
         try:
             LOG.debug("setting up the NOVA database connection: %s"
                       % db_connection)
 
-            self.db_engine = create_engine(db_connection)
+            self.db_engine = create_engine(db_connection, pool_recycle=30)
 
-            transport_url = "{b}://{user}:{password}@{host}:{port}/{virt_host}"
-            transport_url = transport_url.format(
-                b=amqp_backend,
-                user=amqp_user,
-                password=amqp_password,
-                host=amqp_host,
-                port=amqp_port,
-                virt_host=amqp_virt_host)
-
-            self.messagingAPI = MessagingAPI(transport_url)
+            self.messagingAPI = MessagingAPI(amqp_backend, amqp_user,
+                                             amqp_password, amqp_hosts,
+                                             amqp_virt_host)
 
             self.novaBaseRPCAPI = NovaBaseRPCAPI(conductor_topic,
                                                  self.messagingAPI)
@@ -542,7 +601,10 @@ class NovaManager(Manager):
                    "x-tenant-id": server.getProjectId(),
                    "x-instance-id-signature": digest}
 
-        request = requests.get(url, headers=headers, timeout=self.timeout)
+        request = requests.get(url, headers=headers,
+                               timeout=self.timeout,
+                               verify=self.ssl_ca_file,
+                               cert=self.ssl_cert_file)
 
         if request.status_code != requests.codes.ok:
             if request.status_code == 404:
@@ -749,7 +811,7 @@ class NovaManager(Manager):
         try:
             response_data = self.getResource(url, "POST", data)
         except requests.exceptions.HTTPError as ex:
-            raise Exception("error on starting the server info (id=%r)"
+            raise Exception("error on starting the server %s"
                             ": %s" % (id, ex.response.json()))
 
         if response_data:
@@ -989,27 +1051,37 @@ class NovaManager(Manager):
 
         if method == "GET":
             request = requests.get(url, headers=headers,
-                                   params=data, timeout=self.timeout)
+                                   params=data, timeout=self.timeout,
+                                   verify=self.ssl_ca_file,
+                                   cert=self.ssl_cert_file)
         elif method == "POST":
             request = requests.post(url,
                                     headers=headers,
                                     data=json.dumps(data),
-                                    timeout=self.timeout)
+                                    timeout=self.timeout,
+                                    verify=self.ssl_ca_file,
+                                    cert=self.ssl_cert_file)
         elif method == "PUT":
             request = requests.put(url,
                                    headers=headers,
                                    data=json.dumps(data),
-                                   timeout=self.timeout)
+                                   timeout=self.timeout,
+                                   verify=self.ssl_ca_file,
+                                   cert=self.ssl_cert_file)
         elif method == "HEAD":
             request = requests.head(url,
                                     headers=headers,
                                     data=json.dumps(data),
-                                    timeout=self.timeout)
+                                    timeout=self.timeout,
+                                    verify=self.ssl_ca_file,
+                                    cert=self.ssl_cert_file)
         elif method == "DELETE":
             request = requests.delete(url,
                                       headers=headers,
                                       data=json.dumps(data),
-                                      timeout=self.timeout)
+                                      timeout=self.timeout,
+                                      verify=self.ssl_ca_file,
+                                      cert=self.ssl_cert_file)
         else:
             raise Exception("wrong HTTP method: %s" % method)
 

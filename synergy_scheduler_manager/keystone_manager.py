@@ -2,6 +2,7 @@ import json
 import logging
 import requests
 
+from common.domain import Domain
 from common.endpoint import Endpoint
 from common.project import Project
 from common.role import Role
@@ -78,11 +79,22 @@ class KeystoneManager(Manager):
             cfg.IntOpt("clock_skew",
                        help="set the clock skew (seconds)",
                        default=60,
+                       required=False),
+            cfg.StrOpt("ssl_ca_file",
+                       help="set the PEM encoded Certificate Authority to "
+                            "use when verifying HTTPs connections",
+                       default=None,
+                       required=False),
+            cfg.StrOpt("ssl_cert_file",
+                       help="set the SSL client certificate (PEM encoded)",
+                       default=None,
                        required=False)
         ]
 
     def setup(self):
         self.auth_url = CONF.KeystoneManager.auth_url
+        self.ssl_ca_file = CONF.KeystoneManager.ssl_ca_file
+        self.ssl_cert_file = CONF.KeystoneManager.ssl_cert_file
         self.username = CONF.KeystoneManager.username
         self.password = CONF.KeystoneManager.password
         self.user_domain_name = CONF.KeystoneManager.user_domain_name
@@ -93,18 +105,8 @@ class KeystoneManager(Manager):
         self.trust_expiration = CONF.KeystoneManager.trust_expiration
         self.clock_skew = CONF.KeystoneManager.clock_skew
         self.token = None
-        self.auth_public_url = None
 
         self.authenticate()
-
-        service = self.getToken().getService("keystone")
-        if not service:
-            raise Exception("keystone service not found!")
-
-        endpoint = service.getEndpoint("public")
-        if not endpoint:
-            raise Exception("keystone endpoint not found!")
-        self.auth_public_url = endpoint.getURL()
 
     def task(self):
         pass
@@ -187,7 +189,9 @@ class KeystoneManager(Manager):
         response = requests.post(url=self.auth_url + "/auth/tokens",
                                  headers=headers,
                                  data=json.dumps(data),
-                                 timeout=self.timeout)
+                                 timeout=self.timeout,
+                                 verify=self.ssl_ca_file,
+                                 cert=self.ssl_cert_file)
 
         if response.status_code != requests.codes.ok:
             response.raise_for_status()
@@ -216,17 +220,37 @@ class KeystoneManager(Manager):
             user = User()
             user.setId(info["id"])
             user.setName(info["name"])
-            user.setProjectId(info["tenantId"])
             user.setEnabled(info["enabled"])
+
+            if "default_project_id" in info:
+                user.setProjectId(info["default_project_id"])
+            elif "tenantId" in info:
+                user.setProjectId(info["tenantId"])
 
         return user
 
     def getUsers(self, prj_id=None):
+        users = []
+
         if prj_id:
             try:
-                response = self.getResource("tenants/%s/users" % prj_id,
-                                            "GET",
-                                            version="v2.0")
+                data = {"scope.project.id": prj_id}
+                response = self.getResource("role_assignments",
+                                            "GET", data=data)
+                user_list = {}
+
+                for role in response["role_assignments"]:
+                    user_id = role["user"]["id"]
+
+                    if user_id in user_list:
+                        continue
+
+                    user = self.getUser(user_id)
+                    user.setProjectId(prj_id)
+
+                    user_list[user_id] = user
+
+                users = user_list.values()
             except requests.exceptions.HTTPError as ex:
                 response = ex.response.json()
                 raise Exception("error on retrieving the project's users "
@@ -235,24 +259,19 @@ class KeystoneManager(Manager):
         else:
             try:
                 response = self.getResource("/users", "GET")
+
+                for info in response["users"]:
+                    user = User()
+                    user.setId(info["id"])
+                    user.setName(info["name"])
+                    user.setProjectId(info["tenantId"])
+                    user.setEnabled(info["enabled"])
+
+                    users.append(user)
             except requests.exceptions.HTTPError as ex:
                 response = ex.response.json()
                 raise Exception("error on retrieving the users list: %s"
                                 % response["error"]["message"])
-
-        users = []
-
-        if response:
-            user_info = response["users"]
-
-            for info in user_info:
-                user = User()
-                user.setId(info["id"])
-                user.setName(info["name"])
-                user.setProjectId(info["tenantId"])
-                user.setEnabled(info["enabled"])
-
-                users.append(user)
 
         return users
 
@@ -280,6 +299,54 @@ class KeystoneManager(Manager):
 
         return roles
 
+    def getDomain(self, id):
+        try:
+            response = self.getResource("/domains/%s" % id, "GET")
+        except requests.exceptions.HTTPError as ex:
+            response = ex.response.json()
+            raise Exception(
+                "error on retrieving the domain (id=%r, msg=%s)." %
+                (id, response["error"]["message"]))
+
+        domain = None
+
+        if response:
+            info = response["domain"]
+
+            domain = Domain()
+            domain.setId(info["id"])
+            domain.setName(info["name"])
+            domain.setEnabled(info["enabled"])
+
+        return domain
+
+    def getDomains(self, name=None, enabled=True):
+        try:
+            data = {"enabled": enabled}
+            if name:
+                data["name"] = name
+
+            response = self.getResource("/domains", "GET", data=data)
+        except requests.exceptions.HTTPError as ex:
+            response = ex.response.json()
+            raise Exception("error on retrieving the domains list: %s"
+                            % response["error"]["message"])
+
+        domains = []
+
+        if response:
+            domains_info = response["domains"]
+
+            for info in domains_info:
+                domain = Domain()
+                domain.setId(info["id"])
+                domain.setName(info["name"])
+                domain.setEnabled(info["enabled"])
+
+                domains.append(domain)
+
+        return domains
+
     def getProject(self, id):
         try:
             response = self.getResource("/projects/%s" % id, "GET")
@@ -301,7 +368,7 @@ class KeystoneManager(Manager):
 
         return project
 
-    def getProjects(self, usr_id=None):
+    def getProjects(self, usr_id=None, domain_id=None):
         if usr_id:
             try:
                 response = self.getResource(
@@ -312,8 +379,12 @@ class KeystoneManager(Manager):
                                 "%r): %s" % (usr_id,
                                              response["error"]["message"]))
         else:
+            data = None
+            if domain_id:
+                data = {"domain_id": domain_id}
+
             try:
-                response = self.getResource("/projects", "GET")
+                response = self.getResource("/projects", "GET", data=data)
             except requests.exceptions.HTTPError as ex:
                 response = ex.response.json()
                 raise Exception("error on retrieving the projects list: %s"
@@ -402,7 +473,9 @@ class KeystoneManager(Manager):
                             % (id, response["error"]["message"]))
 
         trust = Trust(response["trust"])
-        trust.keystone_url = self.auth_public_url
+        trust.keystone_url = self.auth_url
+        trust.ssl_ca_file = self.ssl_ca_file
+        trust.ssl_cert_file = self.ssl_cert_file
 
         return trust
 
@@ -418,7 +491,9 @@ class KeystoneManager(Manager):
 
         if response:
             trust = Trust(response["trust"])
-            trust.keystone_url = self.auth_public_url
+            trust.keystone_url = self.auth_url
+            trust.ssl_ca_file = self.ssl_ca_file
+            trust.ssl_cert_file = self.ssl_cert_file
 
         return trust
 
@@ -438,15 +513,16 @@ class KeystoneManager(Manager):
 
     def getTrusts(self, user_id=None, isTrustor=True, token=None):
         url = "/OS-TRUST/trusts"
+        data = None
 
         if user_id:
             if isTrustor:
-                url += "?trustor_user_id=%s" % user_id
+                data = {"trustor_user_id": user_id}
             else:
-                url += "?trustee_user_id=%s" % user_id
+                data = {"trustee_user_id": user_id}
 
         try:
-            response = self.getResource(url, "GET", token=token)
+            response = self.getResource(url, "GET", token=token, data=data)
         except requests.exceptions.HTTPError as ex:
             response = ex.response.json()
             raise Exception("error on retrieving the trust list (id=%r): %s"
@@ -457,7 +533,9 @@ class KeystoneManager(Manager):
         if response:
             for data in response["trusts"]:
                 trust = Trust(data)
-                trust.keystone_url = self.auth_public_url
+                trust.keystone_url = self.auth_url
+                trust.ssl_ca_file = self.ssl_ca_file
+                trust.ssl_cert_file = self.ssl_cert_file
 
                 trusts.append(trust)
 
@@ -658,12 +736,11 @@ class KeystoneManager(Manager):
         if token:
             if token.isExpired():
                 raise Exception("token expired!")
-
-            url = self.auth_public_url
         else:
             self.authenticate()
             token = self.getToken()
-            url = self.auth_url
+
+        url = self.auth_url
 
         if version:
             url = url[:url.rfind("/") + 1] + version
@@ -680,27 +757,37 @@ class KeystoneManager(Manager):
             response = requests.get(url,
                                     headers=headers,
                                     params=data,
-                                    timeout=self.timeout)
+                                    timeout=self.timeout,
+                                    verify=self.ssl_ca_file,
+                                    cert=self.ssl_cert_file)
         elif method == "POST":
             response = requests.post(url,
                                      headers=headers,
                                      data=json.dumps(data),
-                                     timeout=self.timeout)
+                                     timeout=self.timeout,
+                                     verify=self.ssl_ca_file,
+                                     cert=self.ssl_cert_file)
         elif method == "PUT":
             response = requests.put(url,
                                     headers=headers,
                                     data=json.dumps(data),
-                                    timeout=self.timeout)
+                                    timeout=self.timeout,
+                                    verify=self.ssl_ca_file,
+                                    cert=self.ssl_cert_file)
         elif method == "HEAD":
             response = requests.head(url,
                                      headers=headers,
                                      data=json.dumps(data),
-                                     timeout=self.timeout)
+                                     timeout=self.timeout,
+                                     verify=self.ssl_ca_file,
+                                     cert=self.ssl_cert_file)
         elif method == "DELETE":
             response = requests.delete(url,
                                        headers=headers,
                                        data=json.dumps(data),
-                                       timeout=self.timeout)
+                                       timeout=self.timeout,
+                                       verify=self.ssl_ca_file,
+                                       cert=self.ssl_cert_file)
         else:
             raise Exception("wrong HTTP method: %s" % method)
 
