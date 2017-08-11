@@ -1,7 +1,7 @@
 %{!?python_sitelib: %global python_sitelib %(%{__python} -c "from distutils.sysconfig import get_python_lib; print(get_python_lib())")}
 
 Name:          python-synergy-scheduler-manager
-Version:       2.4.0
+Version:       2.5.0
 Release:       1%{?dist}
 Summary:       Advanced scheduling capability for OpenStack.
 Source:        %name-%version.tar.bz2
@@ -42,15 +42,33 @@ schedulers.
 rm -rf $RPM_BUILD_ROOT
 %{__python} setup.py install -O1 --skip-build --root $RPM_BUILD_ROOT
 install -D -m0644 config/synergy_scheduler.conf       %{buildroot}%{_sysconfdir}/synergy/synergy_scheduler.conf
+install -D -m0644 config/policy.json                  %{buildroot}%{_sysconfdir}/synergy/policy.json
 
 
 %files
 %doc README.rst
 %{python_sitelib}/*
+%{_sysconfdir}/synergy
+%dir %attr(0755, synergy, synergy) %{_sysconfdir}/synergy/
 %config(noreplace) %{_sysconfdir}/synergy/synergy_scheduler.conf
+%config(noreplace) %{_sysconfdir}/synergy/policy.json
+%attr(0644, synergy, synergy) %{_sysconfdir}/synergy/policy.json
 
 
 %changelog
+* Fri Aug 11 2017 Ervin Konomi <ervin.konomi@pd.infn.it> - 2.5.0-1
+- Added support for policy.json in packaging process
+- Project manager problems concerning the adding and removing projects
+- Authorization policies changed
+- Added queue usage to project
+- Missing security support
+- Synergy should never raise Exception
+- Added support for OpenStack Ocata to NovaManager
+- Partition Director requires configuring Synergy through RESTful API
+- Added support for notifications to KeystoneManager
+- MessagingAPI should be implemented as common module
+- The SchedulerManager doesn't receive all the compute.instance.delete.end notifications
+
 * Mon Mar 20 2017 Ervin Konomi <ervin.konomi@pd.infn.it> - 2.4.0-1
 - Add new "synergy_topic" parameter
 - Fix a possible shared quota consistency issue

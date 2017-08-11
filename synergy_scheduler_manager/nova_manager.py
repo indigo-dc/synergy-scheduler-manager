@@ -4,13 +4,13 @@ import hashlib
 import hmac
 import json
 import logging
-import oslo_messaging as oslo_msg
 import requests
 
 from common.block_device import BlockDeviceMapping
 from common.compute import Compute
 from common.flavor import Flavor
 from common.hypervisor import Hypervisor
+from common.messaging import AMQP
 from common.quota import Quota
 from common.request import Request
 from common.server import Server
@@ -18,6 +18,7 @@ from oslo_config import cfg
 from sqlalchemy import create_engine
 from sqlalchemy.exc import SQLAlchemyError
 from synergy.common.manager import Manager
+from synergy.exception import SynergyError
 
 __author__ = "Lisa Zangrando"
 __email__ = "lisa.zangrando[AT]pd.infn.it"
@@ -42,103 +43,101 @@ LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
 
 
-class MessagingAPI(object):
+class ServerEventHandler(object):
 
-    def __init__(self, amqp_backend, amqp_user,
-                 amqp_password, amqp_hosts, amqp_virt_host):
-        super(MessagingAPI, self).__init__()
+    def __init__(self, nova_manager):
+        super(ServerEventHandler, self).__init__()
 
-        oslo_msg.set_transport_defaults(control_exchange="nova")
+        self.nova_manager = nova_manager
 
-        transport_hosts = self._createTransportHosts(amqp_user,
-                                                     amqp_password,
-                                                     amqp_hosts)
+    def _makeServer(self, server_info):
+        if not server_info:
+            return
 
-        transport_url = oslo_msg.TransportURL(CONF,
-                                              transport=amqp_backend,
-                                              virtual_host=amqp_virt_host,
-                                              hosts=transport_hosts,
-                                              aliases=None)
+        flavor = Flavor()
+        flavor.setMemory(server_info["memory_mb"])
+        flavor.setVCPUs(server_info["vcpus"])
+        flavor.setStorage(server_info["root_gb"])
 
-        self.TRANSPORT = oslo_msg.get_transport(CONF, url=transport_url)
+        if "instance_type" in server_info:
+            flavor.setName(server_info["instance_type"])
 
-    def _createTransportHosts(self, username, password, hosts):
-        """Returns a list of oslo.messaging.TransportHost objects."""
-        transport_hosts = []
+        server = Server()
+        server.setFlavor(flavor)
+        server.setUserId(server_info["user_id"])
+        server.setMetadata(server_info["metadata"])
+        server.setDeletedAt(server_info["deleted_at"])
+        server.setTerminatedAt(server_info["terminated_at"])
 
-        for host in hosts:
-            host = host.strip()
-            host_name, host_port = host.split(":")
+        if "host" in server_info:
+            server.setHost(server_info["host"])
 
-            if not host_port:
-                msg = "Invalid hosts value: %s. It should be"\
-                      " in hostname:port format" % host
-                raise ValueError(msg)
+        if "uuid" in server_info:
+            server.setId(server_info["uuid"])
+        elif "instance_id" in server_info:
+            server.setId(server_info["instance_id"])
 
-            try:
-                host_port = int(host_port)
-            except ValueError:
-                msg = "Invalid port value: %s. It should be an integer"
-                raise ValueError(msg % host_port)
+        if "project_id" in server_info:
+            server.setProjectId(server_info["project_id"])
+        elif "tenant_id" in server_info:
+            server.setProjectId(server_info["tenant_id"])
 
-            transport_hosts.append(oslo_msg.TransportHost(
-                hostname=host_name,
-                port=host_port,
-                username=username,
-                password=password))
-        return transport_hosts
+        if "vm_state" in server_info:
+            server.setState(server_info["vm_state"])
+        elif "state" in server_info:
+            server.setState(server_info["state"])
 
-    def getTarget(self, topic, exchange=None, namespace=None,
-                  version=None, server=None):
-        return oslo_msg.Target(topic=topic,
-                               exchange=exchange,
-                               namespace=namespace,
-                               version=version,
-                               server=server)
+        return server
 
-    def getRPCClient(self, target, version_cap=None, serializer=None):
-        assert self.TRANSPORT is not None
+    def info(self, ctxt, publisher_id, event_type, payload, metadata):
+        LOG.debug("Notification INFO: event_type=%s payload=%s"
+                  % (event_type, payload))
 
-        LOG.debug("creating RPC client with target %s" % target)
-        return oslo_msg.RPCClient(self.TRANSPORT,
-                                  target,
-                                  version_cap=version_cap,
-                                  serializer=serializer)
+        if payload is None or "state" not in payload:
+            return
 
-    def getRPCServer(self, target, endpoints, serializer=None):
-        assert self.TRANSPORT is not None
+        state = payload["state"]
 
-        LOG.debug("creating RPC server with target %s" % target)
-        return oslo_msg.get_rpc_server(self.TRANSPORT,
-                                       target,
-                                       endpoints,
-                                       executor="eventlet",
-                                       serializer=serializer)
+        event_types = ["compute.instance.create.end",
+                       "compute.instance.delete.end",
+                       "compute.instance.update",
+                       "scheduler.run_instance"]
 
-    def getNotificationListener(self, targets, endpoints):
-        assert self.TRANSPORT is not None
+        if event_type not in event_types:
+            return
 
-        LOG.debug("creating notification listener with target %s endpoints %s"
-                  % (targets, endpoints))
-        return oslo_msg.get_notification_listener(self.TRANSPORT,
-                                                  targets,
-                                                  endpoints,
-                                                  allow_requeue=True,
-                                                  executor="eventlet")
+        server_info = None
+
+        if event_type == "scheduler.run_instance":
+            server_info = payload["request_spec"]["instance_type"]
+        else:
+            server_info = payload
+
+        server = self._makeServer(server_info)
+
+        self.nova_manager.notify(event_type="SERVER_EVENT", server=server,
+                                 event=event_type, state=state)
+
+    def warn(self, ctxt, publisher_id, event_type, payload, metadata):
+        LOG.debug("Notification WARN: event_type=%s, payload=%s metadata=%s"
+                  % (event_type, payload, metadata))
+
+    def error(self, ctxt, publisher_id, event_type, payload, metadata):
+        LOG.debug("Notification ERROR: event_type=%s, payload=%s metadata=%s"
+                  % (event_type, payload, metadata))
 
 
 class NovaConductorComputeAPI(object):
 
-    def __init__(self, topic, scheduler_manager, keystone_manager, msg):
-        self.topic = topic
-        self.scheduler_manager = scheduler_manager
-        self.keystone_manager = keystone_manager
-        self.target = msg.getTarget(topic=topic + "_synergy",
+    def __init__(self, synergy_topic, conductor_topic, nova_manager, msg):
+        self.nova_manager = nova_manager
+
+        self.target = msg.getTarget(topic=synergy_topic,
                                     namespace="compute_task",
-                                    version="1.10")
+                                    version="1.16")
 
         self.client = msg.getRPCClient(
-            target=msg.getTarget(topic=topic,
+            target=msg.getTarget(topic=conductor_topic,
                                  namespace="compute_task",
                                  version="1.10"))
 
@@ -147,66 +146,75 @@ class NovaConductorComputeAPI(object):
                         security_groups, block_device_mapping=None,
                         legacy_bdm=True):
         for instance in instances:
+            data = {'instances': [instance],
+                    'image': image,
+                    'filter_properties': filter_properties,
+                    'admin_password': admin_password,
+                    'injected_files': injected_files,
+                    'requested_networks': requested_networks,
+                    'security_groups': security_groups,
+                    'block_device_mapping': block_device_mapping,
+                    'legacy_bdm': legacy_bdm}
+
+            req = {"context": context, "data": data,
+                   "action": "build_instances"}
             try:
-                request = Request.build(context, instance, image,
-                                        filter_properties, admin_password,
-                                        injected_files, requested_networks,
-                                        security_groups, block_device_mapping,
-                                        legacy_bdm)
+                request = Request.fromDict(req)
 
-                self.scheduler_manager.processRequest(request)
+                self.nova_manager.notify(event_type="SERVER_CREATE",
+                                         request=request)
             except Exception as ex:
-                LOG.error("Exception has occured", exc_info=1)
-                LOG.error(ex)
+                LOG.info(ex)
 
-    def build_instance(self, context, instance, image, filter_properties,
-                       admin_password, injected_files, requested_networks,
-                       security_groups, block_device_mapping=None,
-                       legacy_bdm=True):
-        kw = {'instances': [instance],
-              'image': image,
-              'filter_properties': filter_properties,
-              'admin_password': admin_password,
-              'injected_files': injected_files,
-              'requested_networks': requested_networks,
-              'security_groups': security_groups}
+    def schedule_and_build_instances(self, context, build_requests,
+                                     request_specs, image,
+                                     admin_password, injected_files,
+                                     requested_networks, block_device_mapping):
+        index = 0
 
+        for build_request in build_requests:
+            request_spec = request_specs[index]
+
+            index += 1
+
+            data = {'build_requests': [build_request],
+                    'request_specs': [request_spec],
+                    'image': image,
+                    'admin_password': admin_password,
+                    'injected_files': injected_files,
+                    'requested_networks': requested_networks,
+                    'block_device_mapping': block_device_mapping}
+
+            req = {"context": context, "data": data,
+                   "action": "schedule_and_build_instances"}
+
+            request = Request.fromDict(req)
+
+            self.nova_manager.notify(event_type="SERVER_CREATE",
+                                     request=request)
+
+    def build_instance(self, context, action, data):
+        try:
+            cctxt = self.client.prepare()
+            cctxt.cast(context, action, **data)
+        except Exception as ex:
+            LOG.info(ex)
+
+    def migrate_server(self, context, **kwargs):
         cctxt = self.client.prepare()
-        cctxt.cast(context, 'build_instances', **kw)
+        return cctxt.call(context, 'migrate_server', **kwargs)
 
-    def migrate_server(self, context, instance, scheduler_hint, live, rebuild,
-                       flavor, block_migration, disk_over_commit,
-                       reservations=None, clean_shutdown=True,
-                       request_spec=None):
-        kw = {'instance': instance, 'scheduler_hint': scheduler_hint,
-              'live': live, 'rebuild': rebuild, 'flavor': flavor,
-              'block_migration': block_migration,
-              'disk_over_commit': disk_over_commit,
-              'reservations': reservations,
-              'clean_shutdown': clean_shutdown,
-              'request_spec': request_spec,
-              }
-
+    def unshelve_instance(self, context, **kwargs):
         cctxt = self.client.prepare()
-        return cctxt.call(context, 'migrate_server', **kw)
+        cctxt.cast(context, 'unshelve_instance', **kwargs)
 
-    def unshelve_instance(self, context, instance):
-        cctxt = self.client.prepare(version='1.3')
-        cctxt.cast(context, 'unshelve_instance', instance=instance)
+    def rebuild_instance(self, ctxt, **kwargs):
+        cctxt = self.client.prepare()
+        cctxt.cast(ctxt, 'rebuild_instance', **kwargs)
 
-    def rebuild_instance(self, ctxt, instance, new_pass, injected_files,
-                         image_ref, orig_image_ref, orig_sys_metadata, bdms,
-                         recreate=False, on_shared_storage=False, host=None,
-                         preserve_ephemeral=False, kwargs=None):
-        cctxt = self.client.prepare(version='1.8')
-        cctxt.cast(ctxt, 'rebuild_instance',
-                   instance=instance, new_pass=new_pass,
-                   injected_files=injected_files, image_ref=image_ref,
-                   orig_image_ref=orig_image_ref,
-                   orig_sys_metadata=orig_sys_metadata, bdms=bdms,
-                   recreate=recreate, on_shared_storage=on_shared_storage,
-                   preserve_ephemeral=preserve_ephemeral,
-                   host=host)
+    def resize_instance(self, ctxt, **kwargs):
+        cctxt = self.client.prepare()
+        cctxt.cast(ctxt, 'resize_instance', **kwargs)
 
 
 class NovaManager(Manager):
@@ -215,10 +223,18 @@ class NovaManager(Manager):
         super(NovaManager, self).__init__("NovaManager")
 
         self.config_opts = [
+            cfg.StrOpt("amqp_url",
+                       help="the amqp transport url",
+                       default=None,
+                       required=False),
+            cfg.StrOpt("amqp_exchange",
+                       help="the amqp exchange",
+                       default="nova",
+                       required=False),
             cfg.StrOpt("amqp_backend",
                        help="the amqp backend tpye (e.g. rabbit, qpid)",
                        default=None,
-                       required=True),
+                       required=False),
             cfg.ListOpt("amqp_hosts",
                         help="AMQP HA cluster host:port pairs",
                         default=None,
@@ -234,11 +250,11 @@ class NovaManager(Manager):
             cfg.StrOpt("amqp_user",
                        help="the amqp user",
                        default=None,
-                       required=True),
+                       required=False),
             cfg.StrOpt("amqp_password",
                        help="the amqp password",
                        default=None,
-                       required=True),
+                       required=False),
             cfg.StrOpt("amqp_virt_host",
                        help="the amqp virtual host",
                        default="/",
@@ -246,6 +262,10 @@ class NovaManager(Manager):
             cfg.StrOpt("synergy_topic",
                        help="the Synergy topic",
                        default="synergy",
+                       required=False),
+            cfg.StrOpt("notification_topic",
+                       help="the notifiction topic",
+                       default="notifications",
                        required=False),
             cfg.StrOpt("conductor_topic",
                        help="the conductor topic",
@@ -302,15 +322,16 @@ class NovaManager(Manager):
         self.timeout = CONF.NovaManager.timeout
 
         if self.getManager("KeystoneManager") is None:
-            raise Exception("KeystoneManager not found!")
+            raise SynergyError("KeystoneManager not found!")
 
         if self.getManager("SchedulerManager") is None:
-            raise Exception("SchedulerManager not found!")
+            raise SynergyError("SchedulerManager not found!")
 
         self.keystone_manager = self.getManager("KeystoneManager")
-        self.scheduler_manager = self.getManager("SchedulerManager")
 
-        amqp_backend = self.getParameter("amqp_backend", fallback=True)
+        amqp_url = self.getParameter("amqp_url")
+
+        amqp_backend = self.getParameter("amqp_backend")
 
         amqp_hosts = self.getParameter("amqp_hosts")
 
@@ -318,17 +339,21 @@ class NovaManager(Manager):
 
         amqp_port = self.getParameter("amqp_port")
 
-        amqp_user = self.getParameter("amqp_user", fallback=True)
+        amqp_user = self.getParameter("amqp_user")
 
-        amqp_password = self.getParameter("amqp_password", fallback=True)
+        amqp_password = self.getParameter("amqp_password")
 
         amqp_virt_host = self.getParameter("amqp_virt_host")
+
+        amqp_exchange = self.getParameter("amqp_exchange")
 
         db_connection = self.getParameter("db_connection", fallback=True)
 
         host = self.getParameter("host")
 
         synergy_topic = self.getParameter("synergy_topic")
+
+        notification_topic = self.getParameter("notification_topic")
 
         conductor_topic = self.getParameter("conductor_topic")
 
@@ -342,29 +367,40 @@ class NovaManager(Manager):
 
             self.db_engine = create_engine(db_connection, pool_recycle=30)
 
-            self.messagingAPI = MessagingAPI(amqp_backend, amqp_user,
-                                             amqp_password, amqp_hosts,
-                                             amqp_virt_host)
+            self.messaging = AMQP(url=amqp_url, backend=amqp_backend,
+                                  username=amqp_user, password=amqp_password,
+                                  hosts=amqp_hosts, virt_host=amqp_virt_host,
+                                  exchange=amqp_exchange)
 
             self.novaConductorComputeAPI = NovaConductorComputeAPI(
+                synergy_topic,
                 conductor_topic,
-                self.scheduler_manager,
-                self.keystone_manager,
-                self.messagingAPI)
+                self,
+                self.messaging)
 
-            self.conductor_rpc = self.messagingAPI.getRPCServer(
-                target=self.messagingAPI.getTarget(topic=synergy_topic,
-                                                   server=host),
+            self.conductor_rpc = self.messaging.getRPCServer(
+                target=self.messaging.getTarget(topic=synergy_topic,
+                                                server=host),
                 endpoints=[self.novaConductorComputeAPI])
 
             self.conductor_rpc.start()
+
+            self.serverEventHandler = ServerEventHandler(self)
+
+            target = self.messaging.getTarget(topic=notification_topic,
+                                              exchange=amqp_exchange)
+
+            self.listener = self.messaging.getNotificationListener(
+                targets=[target], endpoints=[self.serverEventHandler])
+
+            self.listener.start()
         except Exception as ex:
             LOG.error("Exception has occured", exc_info=1)
             LOG.error("NovaManager initialization failed! %s" % (ex))
             raise ex
 
     def execute(self, command, *args, **kargs):
-        raise Exception("command=%r not supported!" % command)
+        raise SynergyError("command %r not supported!" % command)
 
     def task(self):
         pass
@@ -379,8 +415,8 @@ class NovaManager(Manager):
             return result
 
         if fallback is True:
-            raise Exception("No attribute %r found in [NovaManager] "
-                            "section of synergy.conf" % name)
+            raise SynergyError("No attribute %r found in [NovaManager] "
+                               "section of synergy.conf" % name)
         else:
             return None
 
@@ -391,8 +427,8 @@ class NovaManager(Manager):
         secret = CONF.NovaManager.metadata_proxy_shared_secret
 
         if not secret:
-            return Exception("'metadata_proxy_shared_secret' "
-                             "attribute not defined in synergy.conf")
+            raise SynergyError("'metadata_proxy_shared_secret' "
+                               "attribute not defined in synergy.conf")
 
         digest = hmac.new(secret, server.getId(), hashlib.sha256).hexdigest()
 
@@ -401,12 +437,12 @@ class NovaManager(Manager):
         service = token.getService("nova")
 
         if not service:
-            raise Exception("nova service not found!")
+            raise SynergyError("nova service not found!")
 
         endpoint = service.getEndpoint("public")
 
         if not endpoint:
-            raise Exception("nova endpoint not found!")
+            raise SynergyError("nova endpoint not found!")
 
         url = endpoint.getURL()
         url = url[:url.rfind(":") + 1] + "8775/openstack/2015-10-15/user_data"
@@ -428,9 +464,9 @@ class NovaManager(Manager):
                 return None
             elif request.status_code == 403:
                 if "Invalid proxy request signature" in request._content:
-                    raise Exception("cannot retrieve the 'userdata' value: "
-                                    "check the 'metadata_proxy_shared_secret'"
-                                    " attribute value")
+                    raise SynergyError("cannot retrieve the 'userdata' value: "
+                                       "check the 'metadata_proxy_shared_"
+                                       "secret' attribute value")
                 else:
                     request.raise_for_status()
             else:
@@ -448,8 +484,8 @@ class NovaManager(Manager):
             response_data = self.getResource(url, method="GET")
         except requests.exceptions.HTTPError as ex:
             response = ex.response.json()
-            raise Exception("error on retrieving the flavors list: %s"
-                            % response)
+            raise SynergyError("error on retrieving the flavors list: %s"
+                               % response)
 
         flavors = []
 
@@ -470,8 +506,8 @@ class NovaManager(Manager):
         try:
             response_data = self.getResource("flavors/" + id, "GET")
         except requests.exceptions.HTTPError as ex:
-            raise Exception("error on retrieving the flavor info (id=%r)"
-                            ": %s" % (id, ex.response.json()))
+            raise SynergyError("error on retrieving the flavor info (id=%r)"
+                               ": %s" % (id, ex.response.json()))
 
         flavor = None
 
@@ -498,8 +534,8 @@ class NovaManager(Manager):
             response_data = self.getResource(url, "GET", params)
         except requests.exceptions.HTTPError as ex:
             response = ex.response.json()
-            raise Exception("error on retrieving the servers list"
-                            ": %s" % (id, response))
+            raise SynergyError("error on retrieving the servers list"
+                               ": %s" % (id, response))
 
         servers = []
 
@@ -536,8 +572,8 @@ class NovaManager(Manager):
         try:
             response_data = self.getResource("servers/" + id, "GET")
         except requests.exceptions.HTTPError as ex:
-            raise Exception("error on retrieving the server info (id=%r)"
-                            ": %s" % (id, ex.response.json()))
+            raise SynergyError("error on retrieving the server info (id=%r)"
+                               ": %s" % (id, ex.response.json()))
 
         server = None
 
@@ -568,36 +604,11 @@ class NovaManager(Manager):
 
         return server
 
-    def buildServer(self, request, compute=None):
-        if compute:
-            reqId = request.getId()
-
-            self.novaComputeAPI.build_and_run_instance(
-                request.getContext(),
-                request.getInstance(),
-                compute.getHost(),
-                request.getImage(),
-                request.getInstance(),
-                request.getFilterProperties(),
-                admin_password=request.getAdminPassword(),
-                injected_files=request.getInjectedFiles(),
-                requested_networks=request.getRequestedNetworks(),
-                security_groups=request.getSecurityGroups(),
-                block_device_mapping=self.getBlockDeviceMappingList(reqId),
-                node=compute.getNodeName(),
-                limits=compute.getLimits())
-        else:
-            self.novaConductorComputeAPI.build_instance(
-                context=request.getContext(),
-                instance=request.getInstance(),
-                image=request.getImage(),
-                filter_properties=request.getFilterProperties(),
-                admin_password=request.getAdminPassword(),
-                injected_files=request.getInjectedFiles(),
-                requested_networks=request.getRequestedNetworks(),
-                security_groups=request.getSecurityGroups(),
-                block_device_mapping=request.getBlockDeviceMapping(),
-                legacy_bdm=request.getLegacyBDM())
+    def buildServer(self, request):
+        self.novaConductorComputeAPI.build_instance(
+            request.getContext(),
+            request.getAction(),
+            request.getData())
 
     def deleteServer(self, server):
         if not server:
@@ -609,8 +620,8 @@ class NovaManager(Manager):
         try:
             response_data = self.getResource(url, "DELETE")
         except requests.exceptions.HTTPError as ex:
-            raise Exception("error on deleting the server (id=%r)"
-                            ": %s" % (id, ex.response.json()))
+            raise SynergyError("error on deleting the server (id=%r)"
+                               ": %s" % (id, ex.response.json()))
 
         if response_data:
             response_data = response_data["server"]
@@ -628,40 +639,13 @@ class NovaManager(Manager):
         try:
             response_data = self.getResource(url, "POST", data)
         except requests.exceptions.HTTPError as ex:
-            raise Exception("error on starting the server %s"
-                            ": %s" % (id, ex.response.json()))
+            raise SynergyError("error on starting the server %s"
+                               ": %s" % (id, ex.response.json()))
 
         if response_data:
             response_data = response_data["server"]
 
         return response_data
-
-    def setQuotaTypeServer(self, server):
-        if not server:
-            return
-
-        QUERY = "insert into nova.instance_metadata (created_at, `key`, " \
-            "`value`, instance_uuid) values (%s, 'quota', %s, %s)"
-
-        connection = self.db_engine.connect()
-        trans = connection.begin()
-
-        quota_type = "private"
-
-        if server.isEphemeral():
-            quota_type = "shared"
-
-        try:
-            connection.execute(QUERY,
-                               [server.getCreatedAt(), quota_type,
-                                server.getId()])
-
-            trans.commit()
-        except SQLAlchemyError as ex:
-            trans.rollback()
-            raise Exception(ex.message)
-        finally:
-            connection.close()
 
     def stopServer(self, server):
         if not server:
@@ -674,8 +658,8 @@ class NovaManager(Manager):
         try:
             response_data = self.getResource(url, "POST", data)
         except requests.exceptions.HTTPError as ex:
-            raise Exception("error on stopping the server info (id=%r)"
-                            ": %s" % (id, ex.response.json()))
+            raise SynergyError("error on stopping the server info (id=%r)"
+                               ": %s" % (id, ex.response.json()))
 
         if response_data:
             response_data = response_data["server"]
@@ -691,8 +675,8 @@ class NovaManager(Manager):
             response_data = self.getResource(url, "GET", data)
         except requests.exceptions.HTTPError as ex:
             response = ex.response.json()
-            raise Exception("error on retrieving the hypervisors list: %s"
-                            % response["badRequest"]["message"])
+            raise SynergyError("error on retrieving the hypervisors list: %s"
+                               % response["badRequest"]["message"])
 
         if response_data:
             response_data = response_data["hosts"]
@@ -707,8 +691,9 @@ class NovaManager(Manager):
             response_data = self.getResource(url, "GET", data)
         except requests.exceptions.HTTPError as ex:
             response = ex.response.json()
-            raise Exception("error on retrieving the hypervisor info (id=%r)"
-                            ": %s" % (id, response["badRequest"]["message"]))
+            raise SynergyError("error on retrieving the hypervisor info (id=%r"
+                               "): %s" % (id,
+                                          response["badRequest"]["message"]))
 
         if response_data:
             response_data = response_data["host"]
@@ -724,8 +709,8 @@ class NovaManager(Manager):
         except requests.exceptions.HTTPError as ex:
             LOG.info(ex)
             response = ex.response.json()
-            raise Exception("error on retrieving the hypervisors list: %s"
-                            % response["badRequest"]["message"])
+            raise SynergyError("error on retrieving the hypervisors list: %s"
+                               % response["badRequest"]["message"])
 
         hypervisors = []
 
@@ -760,8 +745,8 @@ class NovaManager(Manager):
         try:
             response_data = self.getResource(url, "GET", data)
         except requests.exceptions.HTTPError as ex:
-            raise Exception("error on retrieving the hypervisor info (id=%r)"
-                            ": %s" % (id, ex.response.json()))
+            raise SynergyError("error on retrieving the hypervisor info (id=%r"
+                               "): %s" % (id, ex.response.json()))
 
         hypervisor = None
 
@@ -792,8 +777,8 @@ class NovaManager(Manager):
                 url = "os-quota-sets/defaults"
                 response_data = self.getResource(url, "GET")
             except requests.exceptions.HTTPError as ex:
-                raise Exception("error on retrieving the quota defaults"
-                                ": %s" % ex.response.json())
+                raise SynergyError("error on retrieving the quota defaults"
+                                   ": %s" % ex.response.json())
         elif id is not None:
             if is_class:
                 url = "os-quota-class-sets/%s" % id
@@ -808,10 +793,10 @@ class NovaManager(Manager):
                 else:
                     quota_data = response_data["quota_set"]
             except requests.exceptions.HTTPError as ex:
-                raise Exception("error on retrieving the quota info (id=%r)"
-                                ": %s" % (id, ex.response.json()))
+                raise SynergyError("error on retrieving the quota info (id=%r)"
+                                   ": %s" % (id, ex.response.json()))
         else:
-            raise Exception("wrong arguments")
+            raise SynergyError("wrong arguments")
 
         quota = None
 
@@ -842,8 +827,8 @@ class NovaManager(Manager):
         try:
             self.getResource(url, "PUT", qs)
         except requests.exceptions.HTTPError as ex:
-            raise Exception("error on updating the quota info (id=%r)"
-                            ": %s" % (id, ex.response.json()))
+            raise SynergyError("error on updating the quota info (id=%r)"
+                               ": %s" % (id, ex.response.json()))
 
     def getResource(self, resource, method, data=None):
         self.keystone_manager.authenticate()
@@ -851,12 +836,12 @@ class NovaManager(Manager):
         service = token.getService("nova")
 
         if not service:
-            raise Exception("nova service not found!")
+            raise SynergyError("nova service not found!")
 
         endpoint = service.getEndpoint("public")
 
         if not endpoint:
-            raise Exception("nova endpoint not found!")
+            raise SynergyError("nova endpoint not found!")
 
         url = endpoint.getURL() + "/" + resource
 
@@ -900,7 +885,7 @@ class NovaManager(Manager):
                                       verify=self.ssl_ca_file,
                                       cert=self.ssl_cert_file)
         else:
-            raise Exception("wrong HTTP method: %s" % method)
+            raise SynergyError("wrong HTTP method: %s" % method)
 
         if request.status_code != requests.codes.ok:
             request.raise_for_status()
@@ -912,24 +897,24 @@ class NovaManager(Manager):
 
     def getTarget(self, topic, exchange=None, namespace=None,
                   version=None, server=None):
-        return self.messagingAPI.getTarget(topic=topic,
-                                           namespace=namespace,
-                                           exchange=exchange,
-                                           version=version,
-                                           server=server)
+        return self.messaging.getTarget(topic=topic,
+                                        namespace=namespace,
+                                        exchange=exchange,
+                                        version=version,
+                                        server=server)
 
     def getRPCClient(self, target, version_cap=None, serializer=None):
-        return self.messagingAPI.getRPCClient(target,
-                                              version_cap=version_cap,
-                                              serializer=serializer)
+        return self.messaging.getRPCClient(target,
+                                           version_cap=version_cap,
+                                           serializer=serializer)
 
     def getRPCServer(self, target, endpoints, serializer=None):
-        return self.messagingAPI.getRPCServer(target,
-                                              endpoints,
-                                              serializer=serializer)
+        return self.messaging.getRPCServer(target,
+                                           endpoints,
+                                           serializer=serializer)
 
     def getNotificationListener(self, targets, endpoints):
-        return self.messagingAPI.getNotificationListener(targets, endpoints)
+        return self.messaging.getNotificationListener(targets, endpoints)
 
     def getProjectUsage(self, prj_id, from_date, to_date):
         usage = {}
@@ -960,7 +945,7 @@ a.launched_at<='%(to_date)s' and (a.terminated_at>='%(from_date)s' or \
                                  "vcpus": float(row[2])}
 
         except SQLAlchemyError as ex:
-            raise Exception(ex.message)
+            raise SynergyError(ex.message)
         finally:
             connection.close()
 
@@ -1007,7 +992,7 @@ where instance_uuid='%(id)s' and deleted_at is NULL""" % {"id": server.getId()}
 
                 servers.append(server)
         except SQLAlchemyError as ex:
-            raise Exception(ex.message)
+            raise SynergyError(ex.message)
         finally:
             connection.close()
 
@@ -1063,18 +1048,18 @@ where instance_uuid='%(id)s' and deleted_at is NULL""" % {"id": server.getId()}
                 servers.append(server)
 
         except SQLAlchemyError as ex:
-            raise Exception(ex.message)
+            raise SynergyError(ex.message)
         finally:
             connection.close()
 
         return servers
 
     def selectComputes(self, request):
-        target = self.messagingAPI.getTarget(topic='scheduler',
-                                             exchange="nova",
-                                             version="4.0")
+        target = self.messaging.getTarget(topic='scheduler',
+                                          exchange="nova",
+                                          version="4.0")
 
-        client = self.messagingAPI.getRPCClient(target)
+        client = self.messaging.getRPCClient(target)
         cctxt = client.prepare(version='4.0')
 
         request_spec = {
@@ -1140,7 +1125,7 @@ nova.block_device_mapping where instance_uuid='%(server_id)s'
 
                 blockDeviceMapList.append(blockDeviceMap)
         except SQLAlchemyError as ex:
-            raise Exception(ex.message)
+            raise SynergyError(ex.message)
         finally:
             connection.close()
 

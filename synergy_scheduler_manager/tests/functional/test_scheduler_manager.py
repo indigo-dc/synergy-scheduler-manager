@@ -13,17 +13,14 @@
 from mock import create_autospec
 from mock import MagicMock
 from sqlalchemy.engine.base import Engine
-from synergy_scheduler_manager.common.flavor import Flavor
 from synergy_scheduler_manager.common.project import Project
-from synergy_scheduler_manager.common.queue import QueueDB
+from synergy_scheduler_manager.common.queue import Queue
 from synergy_scheduler_manager.common.queue import QueueItem
-from synergy_scheduler_manager.common.quota import SharedQuota
-from synergy_scheduler_manager.common.server import Server
-from synergy_scheduler_manager.scheduler_manager import Notifications
+from synergy_scheduler_manager.project_manager import ProjectManager
 from synergy_scheduler_manager.scheduler_manager import Worker
 from synergy_scheduler_manager.tests.unit import base
 
-
+"""
 class TestNotifications(base.TestCase):
 
     def test_info_quota(self):
@@ -119,6 +116,7 @@ class TestNotifications(base.TestCase):
 
         self.assertEqual(0, SharedQuota.getUsage('vcpus'))
         self.assertEqual(0, SharedQuota.getUsage('memory'))
+"""
 
 
 class TestWorker(base.TestCase):
@@ -126,23 +124,41 @@ class TestWorker(base.TestCase):
     # TO COMPLETE
     def setUp(self):
         super(TestWorker, self).setUp()
+        self.db_engine_mock = create_autospec(Engine)
         self.nova_manager_mock = MagicMock()
         self.keystone_manager_mock = MagicMock()
         db_engine_mock = create_autospec(Engine)
 
-        project1 = Project()
-        project1.setId("1")
-        project1.setName("test1")
+        def my_side_effect(*args, **kwargs):
+            project1 = Project()
+            project1.setId(1)
+            project1.setName("test_project1")
+            project1.getShare().setValue(5)
 
-        project2 = Project()
-        project2.setId("2")
-        project2.setName("test2")
+            project2 = Project()
+            project2.setId(2)
+            project2.setName("test_project2")
+            project2.getShare().setValue(55)
 
-        projects_list = {'1': project1, '2': project2}
+            if args[0] == 1:
+                return project1
+            elif args[0] == 2:
+                return project2
+
+        keystone_manager = MagicMock()
+        keystone_manager.getProject.side_effect = my_side_effect
+
+        self.project_manager = ProjectManager()
+        self.project_manager.db_engine = MagicMock()
+        self.project_manager.keystone_manager = keystone_manager
+        self.project_manager.default_TTL = 10
+        self.project_manager.default_share = 30
+        self.project_manager._addProject(1, "test_project1", 10, 50)
+
         self.worker = Worker(
             name="test",
-            queue=QueueDB("testq", db_engine_mock),
-            projects=projects_list,
+            queue=Queue("testq", db_engine=db_engine_mock),
+            project_manager=self.project_manager,
             nova_manager=self.nova_manager_mock,
             keystone_manager=self.keystone_manager_mock)
 
@@ -156,7 +172,6 @@ class TestWorker(base.TestCase):
     def test_run_build_server(self):
 
         def nova_exec_side_effect(command, *args, **kwargs):
-            """Mock nova.execute to do a successful build."""
             if command == "GET_SERVER":
                 res = {"OS-EXT-STS:vm_state": "building",
                        "OS-EXT-STS:task_state": "scheduling"}
@@ -173,7 +188,7 @@ class TestWorker(base.TestCase):
 
         # Mock QueueItem in the queue
         qitem_mock = create_autospec(QueueItem)
-        get_item_mock = create_autospec(self.worker.queue.getItem)
+        get_item_mock = create_autospec(self.worker.queue.dequeue)
         get_item_mock.return_value = qitem_mock
         self.worker.queue.getItem = get_item_mock
 
@@ -181,12 +196,12 @@ class TestWorker(base.TestCase):
         nova_exec = self.nova_manager_mock.execute
         nova_exec.side_effect = nova_exec_side_effect
 
+        project = self.project_manager.getProject(id=1)
         # Mock quota allocation
-        quota_allocate_mock = create_autospec(
-            self.worker.projects['1'].getQuota().allocate)
+        quota_allocate_mock = create_autospec(project.getQuota().allocate)
         quota_allocate_mock.return_value = True
-        self.worker.projects['1'].getQuota().allocate = quota_allocate_mock
+        project.getQuota().allocate = quota_allocate_mock
 
         # Delete item from the queue
-        delete_item_mock = create_autospec(self.worker.queue.deleteItem)
+        delete_item_mock = create_autospec(self.worker.queue.delete)
         self.worker.queue.deleteItem = delete_item_mock
