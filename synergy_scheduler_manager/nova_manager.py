@@ -1,4 +1,3 @@
-import common.utils as utils
 import eventlet
 import hashlib
 import hmac
@@ -68,6 +67,7 @@ class ServerEventHandler(object):
         server.setMetadata(server_info["metadata"])
         server.setDeletedAt(server_info["deleted_at"])
         server.setTerminatedAt(server_info["terminated_at"])
+        server.setType()
 
         if "host" in server_info:
             server.setHost(server_info["host"])
@@ -255,7 +255,7 @@ class NovaManager(Manager):
                        help="the amqp password",
                        default=None,
                        required=False),
-            cfg.StrOpt("amqp_virt_host",
+            cfg.StrOpt("amqp_virtual_host",
                        help="the amqp virtual host",
                        default="/",
                        required=False),
@@ -265,7 +265,7 @@ class NovaManager(Manager):
                        required=False),
             cfg.StrOpt("notification_topic",
                        help="the notifiction topic",
-                       default="notifications",
+                       default="nova_notification",
                        required=False),
             cfg.StrOpt("conductor_topic",
                        help="the conductor topic",
@@ -281,7 +281,7 @@ class NovaManager(Manager):
                        required=False),
             cfg.StrOpt("metadata_proxy_shared_secret",
                        help="the metadata proxy shared secret",
-                       default=None,
+                       default="METADATA_SECRET",
                        required=True),
             cfg.FloatOpt("cpu_allocation_ratio",
                          help="the cpu allocation ratio",
@@ -343,7 +343,7 @@ class NovaManager(Manager):
 
         amqp_password = self.getParameter("amqp_password")
 
-        amqp_virt_host = self.getParameter("amqp_virt_host")
+        amqp_virtual_host = self.getParameter("amqp_virtual_host")
 
         amqp_exchange = self.getParameter("amqp_exchange")
 
@@ -368,8 +368,10 @@ class NovaManager(Manager):
             self.db_engine = create_engine(db_connection, pool_recycle=30)
 
             self.messaging = AMQP(url=amqp_url, backend=amqp_backend,
-                                  username=amqp_user, password=amqp_password,
-                                  hosts=amqp_hosts, virt_host=amqp_virt_host,
+                                  username=amqp_user,
+                                  password=amqp_password,
+                                  hosts=amqp_hosts,
+                                  virt_host=amqp_virtual_host,
                                   exchange=amqp_exchange)
 
             self.novaConductorComputeAPI = NovaConductorComputeAPI(
@@ -546,6 +548,9 @@ class NovaManager(Manager):
                 server.setName(server_data["name"])
                 server.setKeyName(server_data["key_name"])
                 server.setMetadata(server_data["metadata"])
+                server.setUserData(server_data.get("OS-EXT-SRV-ATTR:user_data",
+                                                   None))
+                server.setType()
                 server.setState(server_data["OS-EXT-STS:vm_state"])
                 server.setUserId(server_data["user_id"])
                 server.setProjectId(server_data["tenant_id"])
@@ -555,10 +560,6 @@ class NovaManager(Manager):
                     server_data.get("OS-SRV-USG:launched_at", None))
                 server.setTerminatedAt(
                     server_data.get("OS-SRV-USG:terminated_at", None))
-
-                if "user_data" in server_data:
-                    user_data = server_data["user_data"]
-                    server.setUserData(utils.decodeBase64(user_data))
 
                 if detail:
                     server.setFlavor(self.getFlavor(
@@ -585,6 +586,9 @@ class NovaManager(Manager):
             server.setName(server_data["name"])
             server.setKeyName(server_data["key_name"])
             server.setMetadata(server_data["metadata"])
+            server.setUserData(server_data.get("OS-EXT-SRV-ATTR:user_data",
+                                               None))
+            server.setType()
             server.setState(server_data["OS-EXT-STS:vm_state"])
             server.setUserId(server_data["user_id"])
             server.setProjectId(server_data["tenant_id"])
@@ -594,10 +598,6 @@ class NovaManager(Manager):
                 server_data.get("OS-SRV-USG:launched_at", None))
             server.setTerminatedAt(
                 server_data.get("OS-SRV-USG:terminated_at", None))
-
-            if "user_data" in server_data:
-                user_data = server_data["user_data"]
-                server.setUserData(utils.decodeBase64(user_data))
 
             if detail:
                 server.setFlavor(self.getFlavor(server_data["flavor"]["id"]))
@@ -666,6 +666,52 @@ class NovaManager(Manager):
 
         return response_data
 
+    def setServerMetadata(self, server, key, value):
+        if not server:
+            return
+
+        id = server.getId()
+        data = {"metadata": {key: value}}
+        url = "servers/%s/metadata" % id
+
+        try:
+            response_data = self.getResource(url, "POST", data)
+        except requests.exceptions.HTTPError as ex:
+            raise SynergyError("error on setting the metadata (id=%r)"
+                               ": %s" % (id, ex.response.json()))
+
+        if response_data:
+            response_data = response_data["metadata"]
+
+        return response_data
+
+    def setQuotaTypeServer(self, server):
+        if not server:
+            return
+
+        QUERY = "insert into nova.instance_metadata (created_at, `key`, " \
+            "`value`, instance_uuid) values (%s, 'quota', %s, %s)"
+
+        connection = self.db_engine.connect()
+        trans = connection.begin()
+
+        quota_type = "private"
+
+        if server.isEphemeral():
+            quota_type = "shared"
+
+        try:
+            connection.execute(QUERY,
+                               [server.getCreatedAt(), quota_type,
+                                server.getId()])
+
+            trans.commit()
+        except SQLAlchemyError as ex:
+            trans.rollback()
+            raise SynergyError(ex.message)
+        finally:
+            connection.close()
+
     def getHosts(self):
         data = {}
         url = "os-hosts"
@@ -707,7 +753,6 @@ class NovaManager(Manager):
         try:
             response_data = self.getResource(url, "GET", data)
         except requests.exceptions.HTTPError as ex:
-            LOG.info(ex)
             response = ex.response.json()
             raise SynergyError("error on retrieving the hypervisors list: %s"
                                % response["badRequest"]["message"])
@@ -958,9 +1003,9 @@ a.launched_at<='%(to_date)s' and (a.terminated_at>='%(from_date)s' or \
         try:
             # retrieve the amount of resources in terms of cores and memory
             QUERY = """select a.uuid, a.vcpus, a.memory_mb, a.root_gb, \
-a.vm_state from nova.instances as a WHERE a.project_id='%(project_id)s' \
-and a.vm_state in ('active', 'building', 'error') and a.deleted_at is NULL \
-and a.terminated_at is NULL""" % {"project_id": prj_id}
+a.vm_state, a.user_data from nova.instances as a WHERE a.project_id=\
+'%(project_id)s'and a.vm_state in ('active', 'building', 'error') and \
+a.deleted_at is NULL and a.terminated_at is NULL""" % {"project_id": prj_id}
 
             LOG.debug("getProjectServers query: %s" % QUERY)
 
@@ -975,6 +1020,7 @@ and a.terminated_at is NULL""" % {"project_id": prj_id}
                 server = Server()
                 server.setId(row[0])
                 server.setState(row[4])
+                server.setUserData(row[5])
                 server.setFlavor(flavor)
 
                 QUERY = """select `key`, value from nova.instance_metadata \
@@ -989,6 +1035,7 @@ where instance_uuid='%(id)s' and deleted_at is NULL""" % {"id": server.getId()}
                     metadata[row[0]] = row[1]
 
                 server.setMetadata(metadata)
+                server.setType()
 
                 servers.append(server)
         except SQLAlchemyError as ex:
@@ -1011,7 +1058,7 @@ where instance_uuid='%(id)s' and deleted_at is NULL""" % {"id": server.getId()}
                 ids = "uuid in ('%s') and " % "', '".join(server_ids)
 
             QUERY = """select uuid, vcpus, memory_mb, root_gb, \
-vm_state from nova.instances where project_id = \
+vm_state, user_data from nova.instances where project_id = \
 '%(project_id)s' and deleted_at is NULL and (vm_state='error' or \
 (%(server_ids)s vm_state='active' and terminated_at is NULL \
 and timestampdiff(minute, launched_at, utc_timestamp()) >= %(expiration)s))\
@@ -1030,6 +1077,7 @@ and timestampdiff(minute, launched_at, utc_timestamp()) >= %(expiration)s))\
                 server = Server()
                 server.setId(row[0])
                 server.setState(row[4])
+                server.setUserData(row[5])
                 server.setFlavor(flavor)
 
                 QUERY = """select `key`, value from nova.instance_metadata \
@@ -1044,9 +1092,9 @@ where instance_uuid='%(id)s' and deleted_at is NULL""" % {"id": server.getId()}
                     metadata[row[0]] = row[1]
 
                 server.setMetadata(metadata)
+                server.setType()
 
                 servers.append(server)
-
         except SQLAlchemyError as ex:
             raise SynergyError(ex.message)
         finally:

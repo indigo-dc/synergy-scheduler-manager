@@ -1,7 +1,10 @@
 import logging
+import time
 
 from common.quota import SharedQuota
 from common.request import Request
+from datetime import datetime
+from datetime import timedelta
 from oslo_config import cfg
 from synergy.common.manager import Manager
 from synergy.exception import SynergyError
@@ -64,29 +67,33 @@ class Worker(Thread):
         last_release_time = SharedQuota.getLastReleaseTime()
 
         while not self.exit and not self.queue.isClosed():
-            if last_release_time < SharedQuota.getLastReleaseTime():
-                last_release_time = SharedQuota.getLastReleaseTime()
+            try:
+                if last_release_time < SharedQuota.getLastReleaseTime():
+                    last_release_time = SharedQuota.getLastReleaseTime()
 
-                while queue_items:
-                    self.queue.restore(queue_items.pop(0))
+                    while queue_items:
+                        self.queue.restore(queue_items.pop(0))
 
-            if len(queue_items) >= self.backfill_depth:
-                SharedQuota.wait()
-                continue
+                    for project in self.project_manager.getProjects():
+                        for user in project.getUsers():
+                            self.queue.updatePriority(user)
 
-            queue_item = self.queue.dequeue(block=False)
-
-            if queue_item is None:
-                if self.queue.getSize():
+                if len(queue_items) >= self.backfill_depth:
                     SharedQuota.wait()
                     continue
-                else:
-                    queue_item = self.queue.dequeue(block=True)
 
-            if queue_item is None:
-                continue
+                queue_item = self.queue.dequeue(block=False)
 
-            try:
+                if queue_item is None:
+                    if self.queue.getSize():
+                        SharedQuota.wait()
+                        continue
+                    else:
+                        queue_item = self.queue.dequeue(block=True)
+
+                if queue_item is None:
+                    continue
+
                 request = Request.fromDict(queue_item.getData())
                 user_id = request.getUserId()
                 prj_id = request.getProjectId()
@@ -142,7 +149,7 @@ class Worker(Thread):
                                  "ta=shared" % (server_id, user_id, prj_id))
 
                         found = True
-                    except SynergyError as ex:
+                    except Exception as ex:
                         LOG.error("error on building the server %s (reason=%s)"
                                   % (server.getId(), ex))
 
@@ -154,7 +161,7 @@ class Worker(Thread):
                 else:
                     queue_items.append(queue_item)
 
-            except SynergyError as ex:
+            except Exception as ex:
                 LOG.error("Exception has occured", exc_info=1)
                 LOG.error("Worker %s: %s" % (self.name, ex))
 
@@ -201,6 +208,7 @@ class SchedulerManager(Manager):
         self.backfill_depth = CONF.SchedulerManager.backfill_depth
         self.exit = False
         self.configured = False
+        self.queue = None
 
     def execute(self, command, *args, **kargs):
         raise SynergyError("command %r not supported!" % command)
@@ -208,8 +216,6 @@ class SchedulerManager(Manager):
     def task(self):
         if self.configured:
             return
-
-        self.quota_manager.updateSharedQuota()
 
         try:
             self.queue = self.queue_manager.createQueue("DYNAMIC", "PRIORITY")
@@ -228,7 +234,6 @@ class SchedulerManager(Manager):
                         self.nova_manager,
                         self.keystone_manager,
                         self.backfill_depth)
-        worker.start()
 
         self.workers.append(worker)
 
@@ -248,7 +253,9 @@ class SchedulerManager(Manager):
 
             self._processServerEvent(server, event, state)
         elif event_type == "SERVER_CREATE":
+
             self._processServerCreate(kwargs["request"])
+
         elif event_type == "PROJECT_ADDED":
             if not self.configured:
                 return
@@ -258,16 +265,33 @@ class SchedulerManager(Manager):
             if self.queue and project:
                 project.setQueue(self.queue)
 
+        elif event_type == "USER_PRIORITY_UPDATED":
+            if self.queue:
+                self.queue.updatePriority(kwargs.get("user", None))
+
+        elif event_type == "PROJECT_DONE":
+            for worker in self.workers:
+                worker.start()
+
     def _processServerEvent(self, server, event, state):
+        project = self.project_manager.getProject(id=server.getProjectId())
+
+        if not project:
+            return
+
         if event == "compute.instance.create.end" and state == "active":
             LOG.info("the server %s is now active on host %s"
                      % (server.getId(), server.getHost()))
+
+            now = datetime.now()
+            expiration = now + timedelta(minutes=project.getTTL())
+            expiration = time.mktime(expiration.timetuple())
+            expiration = str(expiration)[:-2]
+
+            self.nova_manager.setServerMetadata(server,
+                                                "expiration_time",
+                                                expiration)
         else:
-            project = self.project_manager.getProject(id=server.getProjectId())
-
-            if not project:
-                return
-
             quota = project.getQuota()
 
             if event == "compute.instance.delete.end":
@@ -279,21 +303,14 @@ class SchedulerManager(Manager):
                     LOG.warn("cannot release server %s "
                              "(reason=%s)" % (server.getId(), ex))
             elif state == "error":
-                LOG.info("error occurred on server %s (host %s)"
-                         % (server.getId(), server.getHost()))
-
                 if not server.getTerminatedAt() and not server.getDeletedAt():
                     try:
-                        self.nova_manager.deleteServer(server)
-                    except Exception as ex:
-                        LOG.error("cannot delete server %s: %s"
-                                  % (server.getId(), ex))
+                        LOG.info("error occurred on server %s (host %s)"
+                                 % (server.getId(), server.getHost()))
 
-                try:
-                    quota.release(server)
-                except Exception as ex:
-                    LOG.warn("cannot release server %s "
-                             "(reason=%s)" % (server.getId(), ex))
+                        self.nova_manager.deleteServer(server)
+                    except Exception:
+                        pass
 
     def _processServerCreate(self, request):
         server = request.getServer()
@@ -320,6 +337,8 @@ class SchedulerManager(Manager):
                                 request.getProjectId(), num_attempts, reason))
                     return
 
+                self.nova_manager.setQuotaTypeServer(server)
+
                 if server.isPermanent():
                     if quota.allocate(server, blocking=False):
                         LOG.info("new request: id=%s user_id=%s prj_id=%s "
@@ -340,12 +359,6 @@ class SchedulerManager(Manager):
                                                     request.getUserId(),
                                                     request.getProjectId()))
                 else:
-                    priority = self.fairshare_manager.calculatePriority(
-                        user_id=request.getUserId(),
-                        prj_id=request.getProjectId(),
-                        timestamp=request.getCreatedAt(),
-                        retry=num_attempts)
-
                     context = request.getContext()
 
                     km = self.keystone_manager
@@ -368,8 +381,9 @@ class SchedulerManager(Manager):
 
                     context["trust_id"] = trust.getId()
                     user = project.getUser(id=request.getUserId())
+                    priority = user.getPriority().getValue()
 
-                    self.queue.enqueue(user, request.toDict(), priority)
+                    self.queue.enqueue(user, request.toDict())
 
                     LOG.info("new request: id=%s user_id=%s prj_id=%s priority"
                              "=%s quota=shared" % (request.getId(),
@@ -378,6 +392,6 @@ class SchedulerManager(Manager):
                                                    priority))
             else:
                 self.nova_manager.buildServer(request)
-        except SynergyError as ex:
+        except Exception as ex:
             LOG.error("Exception has occured", exc_info=1)
             LOG.error(ex)
